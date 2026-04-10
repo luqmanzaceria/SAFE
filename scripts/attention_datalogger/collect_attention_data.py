@@ -42,6 +42,25 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import cv2
+
+
+# ---------------------------------------------------------------------------
+# Image processing helper
+# ---------------------------------------------------------------------------
+
+def center_crop(image: np.ndarray, crop_ratio: float = 0.9) -> np.ndarray:
+    """
+    Apply a center crop with the given area ratio and resize back to original size.
+    Standard for LIBERO-finetuned OpenVLA models.
+    """
+    h, w = image.shape[:2]
+    # Area ratio R -> side ratio sqrt(R)
+    side_ratio = np.sqrt(crop_ratio)
+    new_h, new_w = int(h * side_ratio), int(w * side_ratio)
+    start_h, start_w = (h - new_h) // 2, (w - new_w) // 2
+    cropped = image[start_h : start_h + new_h, start_w : start_w + new_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 # ---------------------------------------------------------------------------
@@ -322,11 +341,17 @@ def collect_real(args):
         env.set_init_state(init_states[episode_idx % n_init])
         obs  = env.reset()
         attn_maps, robot_states, images, actions = [], [], [], []
+        hidden_states = []
         done = False
         t    = 0
 
         while not done and t < max_steps:
             image_rgb = obs["agentview_image"]  # (H, W, 3) uint8
+            
+            # Apply center crop if requested (crucial for LIBERO-finetuned models)
+            if args.center_crop:
+                image_rgb = center_crop(image_rgb)
+                
             state_vec = obs.get("robot0_proprio-state", np.zeros(32, dtype=np.float32))
 
             pil_img = Image.fromarray(image_rgb)
@@ -353,7 +378,7 @@ def collect_real(args):
                 # output_attentions=True is safe here because we are NOT calling
                 # generate(); there is no kv-cache decode loop, so the causal
                 # mask is built once and is correctly shaped.
-                fwd = model(**inputs, output_attentions=True, return_dict=True)
+                fwd = model(**inputs, output_attentions=True, output_hidden_states=args.save_hidden_states, return_dict=True)
                 attn_map = _attentions_to_spatial_map(
                     fwd.attentions,           # tuple of (1, H, S, S) per layer
                     IMAGE_TOKEN_START,
@@ -361,6 +386,13 @@ def collect_real(args):
                     PATCH_H, PATCH_W,
                     use_last_n_layers=4,
                 )
+                
+                if args.save_hidden_states:
+                    # Capture last layer's hidden states: (1, N_tokens, D)
+                    # We usually want the vision tokens or the full sequence.
+                    # failure_prob.data.openvla expects (n_token, d) per step.
+                    last_hidden = fwd.hidden_states[-1][0].detach().cpu().numpy()
+                    hidden_states.append(last_hidden)
 
                 # ── Pass 2: generate action (no output_attentions flag) ───────
                 # Do NOT pass attention_mask here. predict_action() appends one
@@ -417,6 +449,9 @@ def collect_real(args):
             np.stack(images),
             np.stack(actions),
             success,
+            hidden_states=np.stack(hidden_states) if args.save_hidden_states else None,
+            task_id=args.task_id,
+            task_suite_name=args.task_suite,
         )
         if success:
             successes += 1
@@ -601,18 +636,71 @@ def _save_episode(
     images: np.ndarray,          # (T, H, W, 3) uint8
     actions: np.ndarray,         # (T, 7)
     success: int,
+    hidden_states: Optional[np.ndarray] = None, # (T, N_tokens, D)
+    task_id: int = 0,
+    task_suite_name: str = "libero_10",
 ):
+    # 1. Save the standard .npz file (for visualization and general use)
     fname = output_dir / f"ep{episode_idx:03d}_succ{success}.npz"
-    np.savez_compressed(
-        fname,
-        attention_maps=attention_maps,
-        robot_states=robot_states,
-        images=images,
-        actions=actions,
-        success=np.array(success, dtype=np.int32),
-        task_description=np.array(task_description),
-        episode_idx=np.array(episode_idx, dtype=np.int32),
-    )
+    save_dict = {
+        "attention_maps": attention_maps,
+        "robot_states": robot_states,
+        "images": images,
+        "actions": actions,
+        "success": np.array(success, dtype=np.int32),
+        "task_description": np.array(task_description),
+        "episode_idx": np.array(episode_idx, dtype=np.int32),
+    }
+    if hidden_states is not None:
+        save_dict["hidden_states"] = hidden_states
+        
+    np.savez_compressed(fname, **save_dict)
+
+    # 2. Save in the format expected by failure_prob (CSV + PKL + MP4)
+    #    Format: task(\d+)--ep(\d+)--succ(\d+).csv
+    base_name = f"task{task_id}--ep{episode_idx:03d}--succ{success}"
+    csv_path = output_dir / f"{base_name}.csv"
+    pkl_path = output_dir / f"{base_name}.pkl"
+    mp4_path = output_dir / f"{base_name}.mp4"
+
+    # Save CSV with actions and dummy metrics (failure_prob expects these)
+    import pandas as pd
+    df = pd.DataFrame({
+        "action/dx": actions[:, 0],
+        "action/dy": actions[:, 1],
+        "action/dz": actions[:, 2],
+        "action/droll": actions[:, 3],
+        "action/dpitch": actions[:, 4],
+        "action/dyaw": actions[:, 5],
+        "action/dgripper": actions[:, 6],
+    })
+    df.to_csv(csv_path, index=False)
+
+    # Save PKL with metadata and hidden states
+    import pickle
+    rollout_data = {
+        "task_suite_name": task_suite_name,
+        "task_id": task_id,
+        "task_description": task_description,
+        "episode_idx": episode_idx,
+        "episode_success": success,
+    }
+    if hidden_states is not None:
+        rollout_data["hidden_states"] = hidden_states
+    
+    with open(pkl_path, "wb") as f:
+        pickle.dump(rollout_data, f)
+
+    # Save MP4 video
+    try:
+        import cv2
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(mp4_path), fourcc, 10.0, (images.shape[2], images.shape[1]))
+        for img in images:
+            out.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        out.release()
+    except Exception as e:
+        print(f"[warn] Could not save video: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +734,12 @@ def parse_args():
                    help="Directory in which to save .npz rollout files")
     p.add_argument("--action_scale", type=float, default=5.0,
                    help="Multiplier for the arm delta actions (default: 5.0)")
+    p.add_argument("--center_crop", action="store_true", default=True,
+                   help="Apply center crop to observations (recommended for LIBERO)")
+    p.add_argument("--no_center_crop", action="store_false", dest="center_crop",
+                   help="Disable center crop")
+    p.add_argument("--save_hidden_states", action="store_true",
+                   help="Save model hidden states for failure prediction training")
     return p.parse_args()
 
 
