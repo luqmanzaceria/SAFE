@@ -391,7 +391,8 @@ def collect_real(args):
                     # Capture last layer's hidden states: (1, N_tokens, D)
                     # We usually want the vision tokens or the full sequence.
                     # failure_prob.data.openvla expects (n_token, d) per step.
-                    last_hidden = fwd.hidden_states[-1][0].detach().cpu().numpy()
+                    # NumPy does not support BFloat16, so we cast to float32 first.
+                    last_hidden = fwd.hidden_states[-1][0].detach().cpu().to(torch.float32).numpy()
                     hidden_states.append(last_hidden)
 
                 # ── Pass 2: generate action (no output_attentions flag) ───────
