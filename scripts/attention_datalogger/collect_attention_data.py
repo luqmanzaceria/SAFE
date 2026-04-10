@@ -392,6 +392,12 @@ def collect_real(args):
                 mag = np.linalg.norm(action_vec[:3])
                 print(f"  t={t:03d} | raw_mag={raw_mag:.6f} | scaled_mag={mag:.4f} | gripper={action_vec[6]:.2f}")
 
+            attn_maps.append(attn_map)
+            robot_states.append(state_vec)
+            images.append(image_rgb)
+            actions.append(action_vec)
+
+            obs, _reward, done, info = env.step(action_vec)
             t += 1
 
         success = int(info.get("success", False))
