@@ -331,6 +331,12 @@ def collect_real(args):
 
             pil_img = Image.fromarray(image_rgb)
             prompt  = f"In: What action should the robot take to {task_description}?\nOut:"
+            
+            # Diagnostic: print once per episode
+            if t == 0:
+                print(f"[debug] Task: {task_description}")
+                print(f"[debug] Prompt: {prompt}")
+
             try:
                 inputs = processor(prompt, pil_img, return_tensors="pt")
             except TypeError:
@@ -376,12 +382,21 @@ def collect_real(args):
                 action_vec = action_vec.cpu().numpy()
             action_vec = np.asarray(action_vec, dtype=np.float32).ravel()[:7]
 
+            # AMPLIFY ACTIONS for simulation (base OpenVLA is often too "quiet" for LIBERO)
+            action_vec[:6] *= 1.5  # Scale up the 6-DOF arm movements
+            
             attn_maps.append(attn_map)
             robot_states.append(state_vec)
             images.append(image_rgb)
             actions.append(action_vec)
 
             obs, _reward, done, info = env.step(action_vec)
+            
+            # Diagnostic: print action magnitude every 50 steps
+            if t % 50 == 0:
+                mag = np.linalg.norm(action_vec[:3])
+                print(f"  t={t:03d} | arm_delta_mag={mag:.4f} | gripper={action_vec[6]:.2f}")
+
             t += 1
 
         success = int(info.get("success", False))
@@ -430,7 +445,7 @@ def _build_libero_env(task_suite: str, task_id: int):
     # The broken editable-install .pth sometimes adds LIBERO/libero/ instead of
     # LIBERO/, which makes `import libero` skip the namespace layer and breaks
     # `import libero.libero`.
-    _LIBERO_ROOT = "/Users/luqzac/mscv/spring26/vlp_autolab/autolab_project/LIBERO"
+    _LIBERO_ROOT = "/home/ubuntu/vlp/LIBERO"
     _LIBERO_INNER = os.path.join(_LIBERO_ROOT, "libero")
     # Remove the wrong inner path before adding the correct root
     sys.path = [p for p in sys.path if p != _LIBERO_INNER]
