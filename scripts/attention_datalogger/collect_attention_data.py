@@ -314,10 +314,19 @@ def collect_real(args):
         if args.list_unnorm_keys:
             print("[unnorm_keys]", available)
             return
+        
+        # If the user didn't specify or specified a missing key, try to auto-detect
         if args.unnorm_key not in available:
-            print(f"[warn] unnorm_key '{args.unnorm_key}' not found. Available: {available}")
-            print("[warn] Falling back to 'bridge_orig'.")
-            args.unnorm_key = "bridge_orig"
+            if "libero_10" in available:
+                print("[info] Auto-detected 'libero_10' unnorm_key.")
+                args.unnorm_key = "libero_10"
+            elif "bridge_orig" in available:
+                print("[info] Falling back to 'bridge_orig' unnorm_key.")
+                args.unnorm_key = "bridge_orig"
+            else:
+                print(f"[warn] unnorm_key '{args.unnorm_key}' not found. Available: {available}")
+                args.unnorm_key = available[0]
+                print(f"[info] Using first available key: '{args.unnorm_key}'")
 
     # OpenVLA-7b: SigLIP 224×224 input → 16×16 = 256 image-patch tokens
     # Vision tokens begin at position 1 (position 0 = BOS).
