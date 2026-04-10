@@ -382,20 +382,15 @@ def collect_real(args):
                 action_vec = action_vec.cpu().numpy()
             action_vec = np.asarray(action_vec, dtype=np.float32).ravel()[:7]
 
-            # AMPLIFY ACTIONS for simulation (base OpenVLA is often too "quiet" for LIBERO)
-            action_vec[:6] *= 1.5  # Scale up the 6-DOF arm movements
-            
-            attn_maps.append(attn_map)
-            robot_states.append(state_vec)
-            images.append(image_rgb)
-            actions.append(action_vec)
+            raw_mag = np.linalg.norm(action_vec[:3])
 
-            obs, _reward, done, info = env.step(action_vec)
+            # AMPLIFY ACTIONS for simulation (base OpenVLA is often too "quiet" for LIBERO)
+            action_vec[:6] *= args.action_scale  # Scale up the 6-DOF arm movements
             
             # Diagnostic: print action magnitude every 50 steps
             if t % 50 == 0:
                 mag = np.linalg.norm(action_vec[:3])
-                print(f"  t={t:03d} | arm_delta_mag={mag:.4f} | gripper={action_vec[6]:.2f}")
+                print(f"  t={t:03d} | raw_mag={raw_mag:.6f} | scaled_mag={mag:.4f} | gripper={action_vec[6]:.2f}")
 
             t += 1
 
@@ -643,6 +638,8 @@ def parse_args():
                    help="Print available unnorm_keys from the loaded model and exit")
     p.add_argument("--output_dir", default="./attention_rollouts",
                    help="Directory in which to save .npz rollout files")
+    p.add_argument("--action_scale", type=float, default=5.0,
+                   help="Multiplier for the arm delta actions (default: 5.0)")
     return p.parse_args()
 
 
