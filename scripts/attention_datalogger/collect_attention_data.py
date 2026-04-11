@@ -422,14 +422,15 @@ def collect_real(args):
                     # We then take the mean or first depending on implementation.
                     # For now, we'll just pass n_samples to predict_action if it supports it.
                     try:
+                        # Try passing num_return_sequences if n_samples is not accepted directly
                         action_vec = model.predict_action(
                             input_ids=inputs["input_ids"],
                             pixel_values=inputs["pixel_values"],
                             unnorm_key=args.unnorm_key,
                             do_sample=True,
-                            n_samples=n_samples
+                            num_return_sequences=n_samples
                         )
-                    except TypeError:
+                    except (TypeError, ValueError):
                         # Fallback if the local modeling_prismatic.py doesn't support n_samples yet
                         action_vec = model.predict_action(
                             input_ids=inputs["input_ids"],
