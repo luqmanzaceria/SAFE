@@ -413,12 +413,37 @@ def collect_real(args):
                 # causing the "size of tensor a … must match tensor b" RuntimeError.
                 # Omitting attention_mask lets generate() build a fresh all-ones
                 # mask from the actual (post-append) input_ids length.
-                action_vec = model.predict_action(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    unnorm_key=args.unnorm_key,
-                    do_sample=False,
-                )
+                
+                # SAFE Modification: Support sampling multiple actions if n_samples > 1
+                # (This refers to the major change in prismatic/extern/hf/modeling_prismatic.py)
+                n_samples = getattr(args, "n_samples", 1)
+                if n_samples > 1:
+                    # If n_samples > 1, we expect the model to return multiple action candidates.
+                    # We then take the mean or first depending on implementation.
+                    # For now, we'll just pass n_samples to predict_action if it supports it.
+                    try:
+                        action_vec = model.predict_action(
+                            input_ids=inputs["input_ids"],
+                            pixel_values=inputs["pixel_values"],
+                            unnorm_key=args.unnorm_key,
+                            do_sample=True,
+                            n_samples=n_samples
+                        )
+                    except TypeError:
+                        # Fallback if the local modeling_prismatic.py doesn't support n_samples yet
+                        action_vec = model.predict_action(
+                            input_ids=inputs["input_ids"],
+                            pixel_values=inputs["pixel_values"],
+                            unnorm_key=args.unnorm_key,
+                            do_sample=False,
+                        )
+                else:
+                    action_vec = model.predict_action(
+                        input_ids=inputs["input_ids"],
+                        pixel_values=inputs["pixel_values"],
+                        unnorm_key=args.unnorm_key,
+                        do_sample=False,
+                    )
 
             if isinstance(action_vec, torch.Tensor):
                 action_vec = action_vec.cpu().numpy()
@@ -733,6 +758,8 @@ def parse_args():
                    help="Number of failure episodes to collect")
     p.add_argument("--max_steps", type=int, default=300,
                    help="Maximum steps per episode before declaring failure")
+    p.add_argument("--n_samples", type=int, default=1,
+                   help="Number of action samples to generate per step (SAFE feature)")
     p.add_argument("--unnorm_key", default="bridge_orig",
                    help="Action un-normalisation key baked into the OpenVLA checkpoint. "
                         "The base openvla/openvla-7b uses 'bridge_orig'. "
