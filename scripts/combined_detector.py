@@ -47,14 +47,18 @@ Outputs (output_dir/)
 ---------------------
   training_loss.png          base vs combined training curves
   roc_comparison.png         ROC: base vs combined
+  prc_comparison.png         Precision-Recall: base vs combined         (NEW)
   score_curves.png           score trajectories (success / failure)
   attention_weights.png      mean attention weight over time by outcome
   attention_heatmap.png      per-episode heatmap (test set)
   coverage_curve.png         conformal recall vs false-alarm tradeoff
   conformal_histogram.png    score distributions with both thresholds
+  detection_time_curve.png   avg detection time vs recall tradeoff      (NEW)
+  hidden_state_pca.png       PCA of hidden states by outcome / task     (NEW)
+  ablation_table.png         4-row ablation: base/+task/+attn/combined  (NEW)
   per_task_auc.png           per-task AUC: base vs combined
   task_embed_pca.png         2-D PCA of task embeddings
-  summary.png                6-panel dashboard
+  summary.png                9-panel (3×3) dashboard                    (NEW)
   summary.txt                numeric results table
 
 Usage
@@ -82,7 +86,10 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD, PCA
-from sklearn.metrics import roc_auc_score, roc_curve, auc as sk_auc
+from sklearn.metrics import (
+    roc_auc_score, roc_curve, auc as sk_auc,
+    precision_recall_curve, average_precision_score,
+)
 
 sys.path.insert(0, os.path.dirname(__file__))
 from failure_detector import (
@@ -195,6 +202,7 @@ class CombinedFailureDetector(nn.Module):
     def __init__(self, hidden_state_dim: int, task_embed_dim: int,
                  hidden_dim: int = 256, n_layers: int = 2, dropout: float = 0.1):
         super().__init__()
+        self.task_embed_dim = task_embed_dim
         self.input_dim = hidden_state_dim + task_embed_dim
 
         # Shared encoder (n_layers-1 hidden layers)
@@ -215,7 +223,9 @@ class CombinedFailureDetector(nn.Module):
 
     def _cat(self, features: torch.Tensor,
              task_embeds: torch.Tensor) -> torch.Tensor:
-        """(B,T,D) + (B,E) → (B,T,D+E)"""
+        """(B,T,D) + (B,E) → (B,T,D+E). Handles E=0 (attn-only ablation)."""
+        if task_embeds is None or task_embeds.shape[-1] == 0:
+            return features
         te = task_embeds.unsqueeze(1).expand(-1, features.shape[1], -1)
         return torch.cat([features, te], dim=-1)
 
@@ -615,14 +625,282 @@ def plot_task_embed_pca(all_r, encoder, out_dir):
     fig.savefig(p, dpi=150); plt.close(fig); print(f"  -> {p}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Ablation helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _RolloutProxy:
+    """Wraps a Rollout, replacing hidden_states for the task-concat ablation."""
+    def __init__(self, original, new_hidden_states):
+        self._orig         = original
+        self.hidden_states = new_hidden_states
+
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
+def _make_task_concat_rollouts(rollouts, task_embeds):
+    """Return proxy rollouts with task_embed broadcast-appended at every step."""
+    result = []
+    for r, emb in zip(rollouts, task_embeds):
+        T     = r.hidden_states.shape[0]
+        emb_t = torch.from_numpy(emb).unsqueeze(0).expand(T, -1)
+        new_hs = torch.cat([r.hidden_states, emb_t], dim=-1)
+        result.append(_RolloutProxy(r, new_hs))
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Detection-time analysis
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_detection_curve(rollouts, scores_or_pairs, n_points=60):
+    """
+    Sweep thresholds 0→1.  At each threshold return:
+      recall   — fraction of failures that triggered before episode end
+      avg_det  — mean normalised detection time over *all* failures
+                 (missed episodes are penalised as 1.0)
+      far      — false-alarm rate on successes
+    """
+    thresholds = np.linspace(0.0, 1.0, n_points)
+    recalls, det_times, fars = [], [], []
+    for tau in thresholds:
+        n_fail = n_succ = n_fa = 0
+        times  = []
+        for r, item in zip(rollouts, scores_or_pairs):
+            s = item[0] if isinstance(item, tuple) else item
+            if r.episode_success:
+                n_succ += 1
+                if float(s[-1]) >= tau:
+                    n_fa += 1
+            else:
+                n_fail += 1
+                exceed = np.where(s >= tau)[0]
+                if len(exceed) > 0:
+                    times.append(exceed[0] / max(len(s) - 1, 1))
+                else:
+                    times.append(1.0)   # missed → penalise as full episode
+        recalls.append(sum(t < 1.0 for t in times) / max(n_fail, 1))
+        det_times.append(float(np.mean(times)) if times else 1.0)
+        fars.append(n_fa / max(n_succ, 1))
+    return np.array(recalls), np.array(det_times), np.array(fars)
+
+
+def plot_detection_time_curve(test_r, base_scores, comb_out, out_dir,
+                               extra_curves=None):
+    """
+    Two-panel figure:
+      Left : avg normalised detection time (↓) vs recall (↑)  — Pareto front
+      Right: FAR (↓) vs recall (↑)
+    extra_curves: list of (scores_or_pairs, label, color) for ablation models
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    all_series = [
+        (base_scores, "Base",     "steelblue",  "-"),
+        (comb_out,    "Combined", "darkorange", "-"),
+    ]
+    if extra_curves:
+        for sc, lbl, col in extra_curves:
+            all_series.append((sc, lbl, col, "--"))
+
+    for scores, label, color, ls in all_series:
+        rec, dts, far = compute_detection_curve(test_r, scores)
+        axes[0].plot(dts, rec, color=color, lw=2, ls=ls, label=label)
+        axes[1].plot(rec, far, color=color, lw=2, ls=ls, label=label)
+
+    axes[0].set_xlabel("Avg normalised detection time  (0=instant, 1=end of ep)")
+    axes[0].set_ylabel("Recall  (fraction of failures caught)")
+    axes[0].set_title("Early Detection Tradeoff\n(upper-left corner = best)")
+    axes[0].legend(fontsize=9); axes[0].grid(True, alpha=0.3)
+    axes[0].set_xlim(-0.02, 1.02); axes[0].set_ylim(-0.02, 1.02)
+
+    axes[1].set_xlabel("Recall"); axes[1].set_ylabel("False-alarm rate  ↓")
+    axes[1].set_title("Recall–FAR Tradeoff")
+    axes[1].legend(fontsize=9); axes[1].grid(True, alpha=0.3)
+    axes[1].set_xlim(-0.02, 1.02); axes[1].set_ylim(-0.02, 1.02)
+
+    fig.suptitle("Detection Time Analysis", fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "detection_time_curve.png")
+    fig.savefig(p, dpi=150); plt.close(fig); print(f"  -> {p}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Hidden-state PCA
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_hidden_state_pca(all_r, out_dir, n_samples=600, seed=42):
+    """
+    2-D PCA of mean-pooled hidden states.
+    Left panel  : coloured by success/failure outcome
+    Right panel : coloured by task ID
+    """
+    rng     = np.random.RandomState(seed)
+    indices = np.arange(len(all_r))
+    if len(indices) > n_samples:
+        indices = rng.choice(indices, n_samples, replace=False)
+
+    hs       = np.stack([all_r[i].hidden_states.float().mean(0).numpy()
+                         for i in indices])
+    outcomes = np.array([all_r[i].episode_success for i in indices])
+    task_ids = np.array([all_r[i].task_id          for i in indices])
+
+    pca = PCA(n_components=2, random_state=seed)
+    X2  = pca.fit_transform(hs)
+    var = pca.explained_variance_ratio_
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for outcome, label, color, marker in [
+        (1, "Success", "seagreen", "o"),
+        (0, "Failure", "crimson",  "x"),
+    ]:
+        mask = outcomes == outcome
+        axes[0].scatter(X2[mask, 0], X2[mask, 1],
+                        c=color, label=f"{label} (n={mask.sum()})",
+                        s=14, alpha=0.55, marker=marker)
+    axes[0].set_title("Hidden State PCA — by Outcome")
+    axes[0].set_xlabel(f"PC1 ({var[0]:.1%} var)")
+    axes[0].set_ylabel(f"PC2 ({var[1]:.1%} var)")
+    axes[0].legend(fontsize=9); axes[0].grid(True, alpha=0.3)
+
+    unique_tasks = sorted(set(task_ids))
+    cmap = plt.cm.get_cmap("tab10", len(unique_tasks))
+    for i, tid in enumerate(unique_tasks):
+        mask = task_ids == tid
+        axes[1].scatter(X2[mask, 0], X2[mask, 1],
+                        color=cmap(i), label=f"Task {tid}",
+                        s=14, alpha=0.55)
+    axes[1].set_title("Hidden State PCA — by Task")
+    axes[1].set_xlabel(f"PC1 ({var[0]:.1%} var)")
+    axes[1].set_ylabel(f"PC2 ({var[1]:.1%} var)")
+    axes[1].legend(fontsize=7, ncol=2); axes[1].grid(True, alpha=0.3)
+
+    fig.suptitle("OpenVLA Hidden State Feature Space", fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    p = os.path.join(out_dir, "hidden_state_pca.png")
+    fig.savefig(p, dpi=150); plt.close(fig); print(f"  -> {p}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Precision-recall curve
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_prc_comparison(test_r, base_scores, comb_out, out_dir,
+                        extra_curves=None):
+    y_true = np.array([1 - r.episode_success for r in test_r])
+    if len(np.unique(y_true)) < 2:
+        return
+    y_base = np.array([s[-1]      for s in base_scores])
+    y_comb = np.array([s[-1] for s, _ in comb_out])
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+
+    all_series = [
+        (y_base, "Base",     "steelblue"),
+        (y_comb, "Combined", "darkorange"),
+    ]
+    if extra_curves:
+        for ys, lbl, col in extra_curves:
+            all_series.append((ys, lbl, col))
+
+    for ys, label, color in all_series:
+        ap          = average_precision_score(y_true, ys)
+        pre, rec, _ = precision_recall_curve(y_true, ys)
+        ax.plot(rec, pre, lw=2, color=color, label=f"{label}  AP={ap:.3f}")
+
+    base_rate = float(y_true.mean())
+    ax.axhline(base_rate, color="gray", linestyle="--", lw=1,
+               label=f"Chance ({base_rate:.2f})")
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curve"); ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3); ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "prc_comparison.png")
+    fig.savefig(p, dpi=150); plt.close(fig); print(f"  -> {p}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Ablation table
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _compute_model_metrics(rollouts, scores, tau):
+    """Return {auc, ap, acc, recall, far, avg_det} for a scored test set."""
+    y_true = np.array([1 - r.episode_success for r in rollouts])
+    finals = np.array([
+        float(s[0][-1]) if isinstance(s, tuple) else float(s[-1])
+        for s in scores
+    ])
+    has_both = len(np.unique(y_true)) > 1
+    auc_val  = roc_auc_score(y_true, finals)          if has_both else None
+    ap_val   = average_precision_score(y_true, finals) if has_both else None
+    acc      = float(((finals >= 0.5).astype(int) == y_true).mean())
+    nf, ns   = int(y_true.sum()), int((1 - y_true).sum())
+    yp       = (finals >= tau).astype(int)
+    recall   = float((yp[y_true == 1] == 1).sum() / max(nf, 1))
+    far      = float((yp[y_true == 0] == 1).sum() / max(ns, 1))
+    times    = []
+    for r, item in zip(rollouts, scores):
+        s = item[0] if isinstance(item, tuple) else item
+        if not r.episode_success:
+            exceed = np.where(s >= tau)[0]
+            times.append(exceed[0] / max(len(s) - 1, 1) if len(exceed) > 0 else 1.0)
+    avg_det = float(np.mean(times)) if times else 1.0
+    return {"auc": auc_val, "ap": ap_val, "acc": acc,
+            "recall": recall, "far": far, "avg_det": avg_det}
+
+
+def plot_ablation_table(ablation_results, out_dir):
+    """Render the ablation results as a styled matplotlib table."""
+    col_labels = ["Model", "AUC ↑", "AP ↑", "Acc@0.5 ↑",
+                  "Recall@τ ↑", "FAR@τ ↓", "Det.Time ↓"]
+    rows = []
+    for name, m in ablation_results.items():
+        rows.append([
+            name,
+            f"{m['auc']:.4f}" if m["auc"] is not None else "—",
+            f"{m['ap']:.4f}"  if m["ap"]  is not None else "—",
+            f"{m['acc']:.4f}",
+            f"{m['recall']:.4f}",
+            f"{m['far']:.4f}",
+            f"{m['avg_det']:.4f}",
+        ])
+
+    fig, ax = plt.subplots(figsize=(14, 1.6 + 0.8 * len(rows)))
+    ax.axis("off")
+    tbl = ax.table(cellText=rows, colLabels=col_labels,
+                   loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 2.5)
+
+    for j in range(len(col_labels)):
+        tbl[0, j].set_facecolor("#2c5f8a")
+        tbl[0, j].set_text_props(color="white", fontweight="bold")
+    for i in range(1, len(rows) + 1):
+        bg = "#eef4fb" if i % 2 == 0 else "white"
+        for j in range(len(col_labels)):
+            tbl[i, j].set_facecolor(bg)
+    for j in range(len(col_labels)):           # highlight last row (full combined)
+        tbl[len(rows), j].set_facecolor("#fff0cc")
+        tbl[len(rows), j].set_text_props(fontweight="bold")
+
+    ax.set_title("Ablation Study: Contribution of Each Component",
+                 fontsize=12, fontweight="bold", pad=14, y=0.98)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "ablation_table.png")
+    fig.savefig(p, dpi=150, bbox_inches="tight"); plt.close(fig); print(f"  -> {p}")
+
+
 def plot_summary(test_r, base_scores, comb_out,
                  base_losses, comb_losses,
                  tau_base, tau_comb,
                  calib_r, calib_base, calib_comb,
                  out_dir):
-    """6-panel summary dashboard."""
-    fig = plt.figure(figsize=(18, 11))
-    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+    """9-panel (3×3) summary dashboard."""
+    fig = plt.figure(figsize=(18, 14))
+    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.50, wspace=0.38)
     x   = np.linspace(0, 1, 100)
 
     # ── Panel 1: training loss ───────────────────────────────────────────────
@@ -653,8 +931,34 @@ def plot_summary(test_r, base_scores, comb_out,
     ax.set_title("ROC Comparison"); ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
     ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
-    # ── Panel 4: attention weights ───────────────────────────────────────────
+    # ── Panel 4: PRC comparison ──────────────────────────────────────────────
     ax = fig.add_subplot(gs[1, 0])
+    if len(np.unique(y_true)) > 1:
+        for ys, label, color in [
+            (y_base, f"Base  AP={average_precision_score(y_true,y_base):.3f}", "steelblue"),
+            (y_comb, f"Comb  AP={average_precision_score(y_true,y_comb):.3f}", "darkorange"),
+        ]:
+            pre, rec, _ = precision_recall_curve(y_true, ys)
+            ax.plot(rec, pre, lw=2, color=color, label=label)
+        ax.axhline(float(y_true.mean()), color="gray", lw=1, linestyle="--")
+    ax.set_title("Precision-Recall Curve"); ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3); ax.set_xlim(0,1); ax.set_ylim(0,1.05)
+
+    # ── Panel 5: detection time tradeoff ────────────────────────────────────
+    ax = fig.add_subplot(gs[1, 1])
+    for scores, label, color, ls in [
+        (base_scores, "Base",     "steelblue",  "-"),
+        (comb_out,    "Combined", "darkorange", "-"),
+    ]:
+        rec, dts, _ = compute_detection_curve(test_r, scores, n_points=40)
+        ax.plot(dts, rec, color=color, lw=2, ls=ls, label=label)
+    ax.set_xlabel("Avg det. time"); ax.set_ylabel("Recall")
+    ax.set_title("Early Detection Tradeoff\n(upper-left = best)")
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+    ax.set_xlim(-0.02, 1.02); ax.set_ylim(-0.02, 1.02)
+
+    # ── Panel 6: attention weights ───────────────────────────────────────────
+    ax = fig.add_subplot(gs[1, 2])
     succ_w, fail_w = [], []
     for r, (_, w) in zip(test_r, comb_out):
         (succ_w if r.episode_success else fail_w).append(_interp(w, 100))
@@ -669,8 +973,8 @@ def plot_summary(test_r, base_scores, comb_out,
     ax.set_title("Attention Weights (Combined)"); ax.set_ylim(-0.05, 1.05)
     ax.set_xlabel("Normalised time"); ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
-    # ── Panel 5: conformal coverage ──────────────────────────────────────────
-    ax = fig.add_subplot(gs[1, 1])
+    # ── Panel 7: conformal coverage ──────────────────────────────────────────
+    ax = fig.add_subplot(gs[2, 0])
     alphas = np.linspace(0.02, 0.40, 35)
     for calib_s, test_s, label, color in [
         (calib_base, base_scores, "Base",     "steelblue"),
@@ -689,8 +993,8 @@ def plot_summary(test_r, base_scores, comb_out,
     ax.set_title("Conformal Coverage"); ax.set_xlabel("Target recall")
     ax.set_ylabel("Empirical recall"); ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
 
-    # ── Panel 6: final score histogram (combined) ────────────────────────────
-    ax  = fig.add_subplot(gs[1, 2])
+    # ── Panel 8: final score histogram (combined) ────────────────────────────
+    ax  = fig.add_subplot(gs[2, 1])
     ax2 = ax.twinx()
     bins = np.linspace(0, 1, 25)
     succ_f = [s[-1] for r, (s, _) in zip(test_r, comb_out) if     r.episode_success]
@@ -713,6 +1017,11 @@ def plot_summary(test_r, base_scores, comb_out,
     lines2, lbl2 = ax2.get_legend_handles_labels()
     ax.legend(lines1 + lines2, lbl1 + lbl2, fontsize=6)
     ax.grid(True, alpha=0.3)
+
+    # ── Panel 9: score curves (base, test) ───────────────────────────────────
+    ax = fig.add_subplot(gs[2, 2])
+    bs, bf = _score_series(test_r, base_scores)
+    _draw_score_curves(ax, bs, bf, "Score Curves — Base (test)", x)
 
     fig.suptitle("Combined Detector — Dashboard", fontsize=14, fontweight="bold")
     fig.savefig(os.path.join(out_dir, "summary.png"), dpi=150,
@@ -752,6 +1061,9 @@ def main():
     parser.add_argument("--n_layers",       type=int,   default=2)
     parser.add_argument("--batch_size",     type=int,   default=32)
     parser.add_argument("--seed",           type=int,   default=42)
+    parser.add_argument("--run_ablation",   action="store_true", default=True,
+                        help="Train +task-only and +attn-only models for ablation table")
+    parser.add_argument("--no_ablation",    dest="run_ablation", action="store_false")
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -760,12 +1072,12 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── 1. Load ──────────────────────────────────────────────────────────────
-    print("\n[1/6] Loading rollouts ...")
+    print("\n[1/7] Loading rollouts ...")
     all_r     = load_rollouts(args.data_path)
     input_dim = all_r[0].hidden_states.shape[-1]
 
     # ── 2. Task embeddings ───────────────────────────────────────────────────
-    print("\n[2/6] Building task embeddings ...")
+    print("\n[2/7] Building task embeddings ...")
     encoder = TaskEncoder(n_components=args.task_embed_dim)
     encoder.fit(list(dict.fromkeys(r.task_description for r in all_r)))
     all_emb = encoder.transform([r.task_description for r in all_r])
@@ -844,7 +1156,7 @@ def main():
           + (" (unseen tasks)" if args.unseen_task_ratio > 0 else ""))
 
     # ── 4. Train base ────────────────────────────────────────────────────────
-    print("\n[3/6] Training base detector ...")
+    print("\n[3/7] Training base detector ...")
     base = FailureDetector(input_dim, hidden_dim=args.hidden_dim,
                            n_layers=args.n_layers).to(args.device)
     base_losses = train_model(base, train_r, n_epochs=args.n_epochs,
@@ -852,7 +1164,7 @@ def main():
                               batch_size=args.batch_size, device=args.device)
 
     # ── 5. Train combined ────────────────────────────────────────────────────
-    print("\n[4/6] Training combined detector "
+    print("\n[4/7] Training combined detector "
           f"(task-cond {E}-d + attn, λ_attn={args.lambda_attn}) ...")
     comb = CombinedFailureDetector(
         hidden_state_dim=input_dim,
@@ -868,7 +1180,7 @@ def main():
     )
 
     # ── 6. Score all splits ──────────────────────────────────────────────────
-    print("\n[5/6] Scoring ...")
+    print("\n[5/7] Scoring ...")
     base_train = predict(base, train_r, device=args.device)
     base_calib = predict(base, calib_r, device=args.device)
     base_test  = predict(base, test_r,  device=args.device)
@@ -881,8 +1193,42 @@ def main():
     tau_base = calibrate_threshold(calib_r, base_calib, alpha)
     tau_comb = calibrate_threshold(calib_r, comb_calib, alpha)
 
+    # ── 6b. Ablation: +task-only and +attn-only ───────────────────────────────
+    task_test = attn_test = task_calib = attn_calib = None
+    tau_task  = tau_attn  = 0.5
+    if args.run_ablation and E > 0:
+        print("\n[Ablation] Training +task-cond, no-attention model ...")
+        aug_train = _make_task_concat_rollouts(train_r, train_emb)
+        aug_calib = _make_task_concat_rollouts(calib_r, calib_emb)
+        aug_test  = _make_task_concat_rollouts(test_r,  test_emb)
+        task_base = FailureDetector(input_dim + E,
+                                    hidden_dim=args.hidden_dim,
+                                    n_layers=args.n_layers).to(args.device)
+        train_model(task_base, aug_train, n_epochs=args.n_epochs,
+                    lr=args.lr, lambda_reg=args.lambda_reg,
+                    batch_size=args.batch_size, device=args.device)
+        task_calib = predict(task_base, aug_calib, device=args.device)
+        task_test  = predict(task_base, aug_test,  device=args.device)
+        tau_task   = calibrate_threshold(calib_r, task_calib, alpha)
+
+        print("\n[Ablation] Training +attention-only, no-task model ...")
+        zero_tr = np.zeros((len(train_r), 0), dtype=np.float32)
+        zero_ca = np.zeros((len(calib_r), 0), dtype=np.float32)
+        zero_te = np.zeros((len(test_r),  0), dtype=np.float32)
+        attn_model = CombinedFailureDetector(
+            hidden_state_dim=input_dim, task_embed_dim=0,
+            hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+        ).to(args.device)
+        _train_combined(attn_model, train_r, zero_tr,
+                        n_epochs=args.n_epochs, lr=args.lr,
+                        lambda_reg=args.lambda_reg, lambda_attn=args.lambda_attn,
+                        batch_size=args.batch_size, device=args.device)
+        attn_calib = _predict_combined(attn_model, calib_r, zero_ca, device=args.device)
+        attn_test  = _predict_combined(attn_model, test_r,  zero_te, device=args.device)
+        tau_attn   = calibrate_threshold(calib_r, attn_calib, alpha)
+
     # ── 7. Results ───────────────────────────────────────────────────────────
-    print("\n[6/6] Evaluating & visualising ...")
+    print("\n[6/7] Evaluating & reporting ...")
     y_true  = np.array([1 - r.episode_success for r in test_r])
     y_base  = np.array([s[-1]      for s in base_test])
     y_comb  = np.array([s[-1]      for s, _ in comb_test])
@@ -891,6 +1237,7 @@ def main():
         lines.append(f"\n─── {title} ───")
         if len(np.unique(y_true)) > 1:
             lines.append(f"  AUC:                 {roc_auc_score(y_true, ys):.4f}")
+            lines.append(f"  AP:                  {average_precision_score(y_true, ys):.4f}")
         yt = y_true
         acc_f  = float(((ys >= 0.5).astype(int) == yt).mean())
         nf, ns = yt.sum(), (1 - yt).sum()
@@ -898,12 +1245,29 @@ def main():
         rec = float((yp_tau[yt == 1] == 1).sum() / max(nf, 1))
         far = float((yp_tau[yt == 0] == 1).sum() / max(ns, 1))
         acc_c = float((yp_tau == yt).mean())
+        times = []
+        for r, item in zip(test_r, [s for s in base_test] if ys is y_base else
+                           [(s, _) for s, _ in comb_test]):
+            s_arr = item if isinstance(item, np.ndarray) else item[0]
+            if not r.episode_success:
+                exceed = np.where(s_arr >= tau)[0]
+                times.append(exceed[0] / max(len(s_arr)-1, 1) if len(exceed)>0 else 1.0)
+        avg_det = float(np.mean(times)) if times else 1.0
         lines.append(f"  Accuracy @ 0.50:     {acc_f:.4f}")
-        lines.append(f"  Conformal τ={tau:.4f}: recall={rec:.4f}  FAR={far:.4f}  acc={acc_c:.4f}")
+        lines.append(f"  Conformal τ={tau:.4f}: recall={rec:.4f}  FAR={far:.4f}  "
+                     f"acc={acc_c:.4f}  avg_det={avg_det:.4f}")
 
     lines = []
     _report("Base detector",     y_base, tau_base)
     _report("Combined detector", y_comb, tau_comb)
+
+    # Ablation rows in text report
+    if task_test is not None:
+        y_task = np.array([s[-1] for s in task_test])
+        _report("+Task (no attn)", y_task, tau_task)
+    if attn_test is not None:
+        y_attn = np.array([s[-1] for s, _ in attn_test])
+        _report("+Attn (no task)", y_attn, tau_attn)
 
     print("\n" + "=" * 60)
     print("COMBINED DETECTOR — RESULTS")
@@ -918,7 +1282,8 @@ def main():
         f.write("\n".join(lines))
     print(f"\n  -> {summary_path}")
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
+    # ── 8. Plots ──────────────────────────────────────────────────────────────
+    print("\n[7/7] Generating plots ...")
     plot_training_loss(base_losses, comb_losses, args.output_dir)
     plot_roc_comparison(test_r, base_test, comb_test, args.output_dir)
     plot_score_curves(test_r, base_test, comb_test, args.output_dir)
@@ -930,6 +1295,40 @@ def main():
                               tau_base, tau_comb, args.output_dir)
     plot_per_task_auc(test_r, base_test, comb_test, args.output_dir)
     plot_task_embed_pca(all_r, encoder, args.output_dir)
+
+    # New analysis plots
+    ablation_extra = []
+    if task_test is not None:
+        ablation_extra.append((task_test, "+Task only", "mediumseagreen"))
+    if attn_test is not None:
+        ablation_extra.append((attn_test, "+Attn only", "mediumpurple"))
+
+    plot_detection_time_curve(test_r, base_test, comb_test, args.output_dir,
+                               extra_curves=ablation_extra if ablation_extra else None)
+    plot_hidden_state_pca(all_r, args.output_dir)
+    plot_prc_comparison(test_r, base_test, comb_test, args.output_dir,
+                        extra_curves=(
+                            [(np.array([s[-1] for s in task_test]),
+                              "+Task only", "mediumseagreen")]
+                            if task_test is not None else None
+                        ))
+
+    # Ablation table
+    if args.run_ablation:
+        ablation_results = {
+            "Base (MLP, running mean)":
+                _compute_model_metrics(test_r, base_test, tau_base),
+        }
+        if task_test is not None:
+            ablation_results["+Task cond (MLP+task, running mean)"] = \
+                _compute_model_metrics(test_r, task_test, tau_task)
+        if attn_test is not None:
+            ablation_results["+Attn only (no task, causal attn)"] = \
+                _compute_model_metrics(test_r, attn_test, tau_attn)
+        ablation_results["Combined (+task +attn, conformal)"] = \
+            _compute_model_metrics(test_r, comb_test, tau_comb)
+        plot_ablation_table(ablation_results, args.output_dir)
+
     plot_summary(test_r, base_test, comb_test,
                  base_losses, comb_losses,
                  tau_base, tau_comb,
