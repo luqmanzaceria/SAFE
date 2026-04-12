@@ -168,14 +168,15 @@ class RolloutDataset(Dataset):
 
 class FailureDetector(nn.Module):
     """
-    Per-timestep MLP that outputs a cumulative-mean failure score in [0, 1].
+    Per-timestep MLP failure detector.
 
-    Score -> 0  means the model thinks this rollout will succeed.
-    Score -> 1  means the model thinks this rollout is failing.
+    Training  uses raw per-step sigmoid outputs with BCE loss — this prevents
+    the score-collapse that occurs when training directly on the running mean.
 
-    The MLP projects each hidden-state vector to a raw scalar; the final score
-    at step t is the running mean of all raw scalars up to t, making the score
-    monotonically more informative as the episode progresses.
+    Inference returns a running-mean score in [0, 1] at each timestep so the
+    visualisations accumulate evidence smoothly over the episode:
+      Score -> 0  means the model thinks this rollout will succeed.
+      Score -> 1  means the model thinks this rollout is failing.
     """
     def __init__(self, input_dim: int, hidden_dim: int = 256,
                  n_layers: int = 2, dropout: float = 0.1):
@@ -189,45 +190,54 @@ class FailureDetector(nn.Module):
         layers += [nn.Linear(in_dim, 1), nn.Sigmoid()]
         self.mlp = nn.Sequential(*layers)
 
+    def forward_raw(self, features: torch.Tensor) -> torch.Tensor:
+        """Raw per-step failure probability (B, T) — used for training loss."""
+        return self.mlp(features).squeeze(-1)
+
     def forward(self, features: torch.Tensor,
                 valid_masks: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            features:     (B, T, D)
-            valid_masks:  (B, T)  -- 1 for real steps, 0 for padding
-        Returns:
-            scores: (B, T)  running-mean failure score, 0 on padded positions
+        Running-mean failure score (B, T) — used for visualisation.
+        Each position t holds the mean of raw outputs from step 0..t,
+        giving a score that accumulates evidence as the episode progresses.
+        Padded positions are zeroed out.
         """
-        raw    = self.mlp(features).squeeze(-1)          # (B, T)
-        cum    = torch.cumsum(raw, dim=-1)                # (B, T)
+        raw    = self.forward_raw(features)                   # (B, T)
+        cum    = torch.cumsum(raw, dim=-1)                    # (B, T)
         t      = torch.arange(1, raw.shape[1] + 1,
                                device=raw.device).float()
-        scores = cum / t.unsqueeze(0)                     # (B, T)
+        scores = cum / t.unsqueeze(0)                         # (B, T)
         return scores * valid_masks
 
 
-def _compute_loss(scores, masks, labels,
+def _compute_loss(raw_scores, masks, labels,
                   lambda_reg: float = 1e-2, model=None):
     """
-    Margin-style loss:
-      - successful episodes: push scores toward 0
-      - failed episodes:     push scores toward 1
-    Class-frequency re-weighting handles imbalanced data automatically.
+    BCE loss on raw per-step outputs.
+
+    Target for each step = 1 if the episode fails, 0 if it succeeds.
+    Class imbalance is handled via pos_weight (inverse frequency ratio).
+
+    Training on raw (pre-cumulation) outputs avoids the collapse seen when
+    training on running-mean scores: the hinge loss on running-mean values
+    requires pushing every single raw output to 1.0 for failures, which
+    causes all scores to saturate.  BCE on raw outputs provides clean,
+    local gradients at each timestep instead.
     """
     n_s = labels.sum().item() + 1e-6
     n_f = (1 - labels).sum().item() + 1e-6
-    n   = len(labels)
-    w_s = n / (2 * n_s)
-    w_f = n / (2 * n_f)
+    # pos_weight > 1 when successes outnumber failures (typical)
+    pos_weight = torch.tensor(n_s / n_f, device=raw_scores.device)
 
-    is_s = labels.unsqueeze(1)    # (B, 1)
-    is_f = 1 - is_s
+    # Target: 1 = failure episode, 0 = success episode (same for every step)
+    targets = (1 - labels).unsqueeze(1).expand_as(raw_scores)  # (B, T)
 
-    loss_s = is_s * torch.relu(scores)          # push success -> 0
-    loss_f = is_f * torch.relu(1.0 - scores)    # push failure -> 1
-
-    per_step = w_s * loss_s + w_f * loss_f
-    loss = (per_step * masks).sum() / (masks.sum() + 1e-8)
+    bce = nn.functional.binary_cross_entropy(
+        raw_scores, targets, reduction="none"
+    )                                                          # (B, T)
+    # Apply pos_weight manually (BCE expects logits for built-in pos_weight)
+    weighted_bce = bce * (targets * pos_weight + (1 - targets))
+    loss = (weighted_bce * masks).sum() / (masks.sum() + 1e-8)
 
     if model is not None and lambda_reg > 0:
         reg = sum(p.pow(2).sum()
@@ -256,8 +266,9 @@ def train_model(model, rollouts, n_epochs=300, lr=1e-3,
             lbl  = batch["success_labels"].to(device)
 
             opt.zero_grad()
-            scores = model(feat, mask)
-            loss   = _compute_loss(scores, mask, lbl, lambda_reg, model)
+            # Train on raw per-step outputs (not the cumulated visualisation score)
+            raw_scores = model.forward_raw(feat)
+            loss = _compute_loss(raw_scores, mask, lbl, lambda_reg, model)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
