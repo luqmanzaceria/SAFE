@@ -363,10 +363,19 @@ def main():
                 lambda_reg=args.lambda_reg, batch_size=args.batch_size,
                 device=args.device)
 
+    # Use the *actual* embedding dimension from the fitted encoder — sklearn's
+    # TruncatedSVD silently caps n_components at the rank of the fitted matrix.
+    # With few unique task descriptions (e.g. 10 for libero_spatial) the real
+    # output dim may be less than args.task_embed_dim.
+    actual_embed_dim = all_embeds.shape[-1]
+    if actual_embed_dim != args.task_embed_dim:
+        print(f"  [TaskEncoder] actual embed dim = {actual_embed_dim} "
+              f"(requested {args.task_embed_dim}, capped by SVD rank)")
+
     print("\n[4/5] Training task-conditioned detector ...")
     cond_model = TaskCondFailureDetector(
         hidden_state_dim=input_dim,
-        task_embed_dim=args.task_embed_dim,
+        task_embed_dim=actual_embed_dim,
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
     ).to(args.device)

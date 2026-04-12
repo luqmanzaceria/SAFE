@@ -89,8 +89,10 @@ def calibrate_threshold(
                          "increase --calib_ratio or collect more failures.")
 
     n   = len(failure_scores)
-    # Finite-sample correction: use ceil((1-α)(n+1))/n quantile
-    q_idx = int(np.ceil((1 - alpha) * (n + 1))) - 1
+    # We want the α-th quantile (lower tail) of the failure scores so that
+    # (1-α) fraction of calibration failures lie AT OR ABOVE τ.
+    # Finite-sample correction: index = ceil(α · (n+1)) − 1  (0-based).
+    q_idx = int(np.ceil(alpha * (n + 1))) - 1
     q_idx = max(0, min(n - 1, q_idx))
     tau   = float(np.sort(failure_scores)[q_idx])
     return tau
