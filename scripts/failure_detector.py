@@ -574,6 +574,74 @@ def plot_summary(train_r, test_r, train_s, test_s, save_path):
     print(f"  -> {save_path}")
 
 
+def plot_early_detection(rollouts, scores, threshold: float, save_path: str):
+    """
+    For every true-failure episode plot where in the episode (normalised 0→1)
+    the running-mean score first crosses `threshold`.
+
+    Left panel:  histogram of detection times (failures only)
+    Right panel: cumulative detection rate vs. normalised episode time
+    """
+    detection_times = []
+    undetected_fail = 0
+    fp_times = []
+
+    for r, s in zip(rollouts, scores):
+        arr = np.array(s)
+        crossings = np.where(arr >= threshold)[0]
+        if r.episode_success:
+            if len(crossings) > 0:
+                fp_times.append(crossings[0] / max(len(s) - 1, 1))
+        else:
+            if len(crossings) > 0:
+                detection_times.append(crossings[0] / max(len(s) - 1, 1))
+            else:
+                undetected_fail += 1
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    bins = np.linspace(0, 1, 25)
+
+    ax = axes[0]
+    if detection_times:
+        ax.hist(detection_times, bins=bins, color="crimson", alpha=0.7,
+                label=f"Failure detected (n={len(detection_times)})")
+    if fp_times:
+        ax.hist(fp_times, bins=bins, color="seagreen", alpha=0.5,
+                label=f"False alarm / success (n={len(fp_times)})")
+    ax.set_xlabel("Normalised detection time  (0=start, 1=end)")
+    ax.set_ylabel("Count")
+    ax.set_title(f"When Does Detector Trigger?  (thresh={threshold})")
+    if undetected_fail:
+        ax.text(0.98, 0.97, f"{undetected_fail} failures never detected",
+                transform=ax.transAxes, ha="right", va="top",
+                color="gray", fontsize=8)
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    ax2 = axes[1]
+    if detection_times:
+        t_sorted  = np.sort(detection_times)
+        cum_frac  = np.arange(1, len(t_sorted) + 1) / \
+                    (len(detection_times) + undetected_fail)
+        ax2.step(np.concatenate([[0], t_sorted, [1]]),
+                 np.concatenate([[0], cum_frac, [cum_frac[-1]]]),
+                 color="crimson", lw=2, label="Failure detection rate")
+    if fp_times:
+        t_fp_s = np.sort(fp_times)
+        n_succ = max(sum(r.episode_success for r in rollouts), 1)
+        cum_fp = np.arange(1, len(t_fp_s) + 1) / n_succ
+        ax2.step(np.concatenate([[0], t_fp_s, [1]]),
+                 np.concatenate([[0], cum_fp, [cum_fp[-1]]]),
+                 color="seagreen", lw=2, linestyle="--",
+                 label="False-alarm rate (successes)")
+    ax2.set_xlabel("Normalised time"); ax2.set_ylabel("Cumulative fraction")
+    ax2.set_title("Cumulative Detection Rate Over Episode Time")
+    ax2.set_xlim(0, 1); ax2.set_ylim(0, 1.05)
+    ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout(); fig.savefig(save_path, dpi=150); plt.close(fig)
+    print(f"  -> {save_path}")
+
+
 # ───────────────────────────── Annotated video ─────────────────────────────────
 
 def _read_video(mp4_path):
@@ -711,6 +779,8 @@ def main():
     parser.add_argument("--seed",        type=int,   default=42)
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--save_model",  action="store_true",
+                        help="Save the trained model to output_dir/detector.pth")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -824,8 +894,45 @@ def main():
                   f"{roc_auc_score(y_true, y_score):.4f}")
         acc = np.mean((y_score > 0.5) == y_true)
         print(f"  Accuracy @ threshold 0.5:      {acc:.4f}")
+
+        # ── Early detection time ─────────────────────────────────────────
+        # For each true-failure episode: at what fraction of its length does
+        # the running-mean score first exceed 0.5?  Lower = earlier warning.
+        thresh = 0.5
+        early_times = []
+        for r, s in zip(test_rollouts, test_scores):
+            if r.episode_success:
+                continue           # only measure on actual failures
+            crossings = np.where(np.array(s) >= thresh)[0]
+            if len(crossings) > 0:
+                t_norm = crossings[0] / max(len(s) - 1, 1)
+                early_times.append(t_norm)
+
+        if early_times:
+            print(f"\n  Early-detection on failures:")
+            print(f"    Detected {len(early_times)} / "
+                  f"{sum(1 for r in test_rollouts if not r.episode_success)} "
+                  f"failure episodes")
+            print(f"    Mean detection time:  "
+                  f"{np.mean(early_times):.3f}  (0=start, 1=end of episode)")
+            print(f"    Median detection time:{np.median(early_times):.3f}")
+            # Also generate the plot
+            plot_early_detection(test_rollouts, test_scores,
+                                 thresh, os.path.join(out, "early_detection.png"))
+
     print(f"\n  All outputs saved to:  {os.path.abspath(out)}/")
     print("=" * 60)
+
+    # ── Save model checkpoint ───────────────────────────────────────────────
+    if args.save_model:
+        ckpt_path = os.path.join(out, "detector.pth")
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "input_dim":  all_rollouts[0].hidden_states.shape[-1],
+            "hidden_dim": args.hidden_dim,
+            "n_layers":   args.n_layers,
+        }, ckpt_path)
+        print(f"  Model checkpoint saved to: {ckpt_path}")
 
 
 if __name__ == "__main__":
