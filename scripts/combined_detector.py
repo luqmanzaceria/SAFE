@@ -730,12 +730,16 @@ def main():
         description="Combined task-conditioned + attention + conformal detector",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data_path",      required=True)
-    parser.add_argument("--output_dir",     default="./combined_results")
-    parser.add_argument("--train_ratio",    type=float, default=0.60,
-                        help="Fraction for training (remaining split calib/test)")
-    parser.add_argument("--calib_ratio",    type=float, default=0.20,
-                        help="Fraction for conformal calibration")
+    parser.add_argument("--data_path",         required=True)
+    parser.add_argument("--output_dir",        default="./combined_results")
+    parser.add_argument("--train_ratio",       type=float, default=0.60,
+                        help="Fraction of SEEN episodes used for training")
+    parser.add_argument("--calib_ratio",       type=float, default=0.20,
+                        help="Fraction of SEEN episodes used for conformal calibration")
+    parser.add_argument("--unseen_task_ratio", type=float, default=0.30,
+                        help="Fraction of task IDs held out entirely for testing. "
+                             "Set to 0.0 to fall back to a random episode split "
+                             "(faster but inflated metrics due to task leakage).")
     parser.add_argument("--target_recall",  type=float, default=0.90,
                         help="Desired recall for the conformal threshold")
     parser.add_argument("--task_embed_dim", type=int,   default=32)
@@ -767,36 +771,77 @@ def main():
     all_emb = encoder.transform([r.task_description for r in all_r])
     E       = all_emb.shape[-1]   # actual (possibly capped) embed dim
 
-    # ── 3. 3-way stratified split ────────────────────────────────────────────
-    rng      = np.random.RandomState(args.seed)
-    s_idx    = [i for i, r in enumerate(all_r) if     r.episode_success]
-    f_idx    = [i for i, r in enumerate(all_r) if not r.episode_success]
-    rng.shuffle(s_idx); rng.shuffle(f_idx)
-
-    def _split3(idx):
-        n  = len(idx)
-        n_tr = max(1, int(n * args.train_ratio))
-        n_ca = max(1, int(n * args.calib_ratio))
-        return idx[:n_tr], idx[n_tr:n_tr+n_ca], idx[n_tr+n_ca:]
-
-    s_tr, s_ca, s_te = _split3(s_idx)
-    f_tr, f_ca, f_te = _split3(f_idx)
+    # ── 3. Split ─────────────────────────────────────────────────────────────
+    rng = np.random.RandomState(args.seed)
 
     def _gather(idx):
-        return ([all_r[i]   for i in idx],
+        idx = list(idx)
+        return ([all_r[i] for i in idx],
                 all_emb[idx] if len(idx) else np.zeros((0, E), np.float32))
-
-    train_r, train_emb = _gather(s_tr + f_tr)
-    calib_r, calib_emb = _gather(s_ca + f_ca)
-    test_r,  test_emb  = _gather(s_te + f_te)
 
     def _counts(r):
         ns = sum(x.episode_success for x in r)
         return f"{len(r)} ({ns} succ / {len(r)-ns} fail)"
 
+    if args.unseen_task_ratio > 0:
+        # ── Seen / unseen TASK split ─────────────────────────────────────────
+        # Completely hold out a fraction of task IDs.
+        # Train + calibrate on seen tasks only; test EXCLUSIVELY on unseen tasks.
+        # This gives an honest generalisation estimate with no task leakage.
+        all_task_ids = sorted(set(r.task_id for r in all_r))
+        shuffled_ids = all_task_ids.copy()
+        rng.shuffle(shuffled_ids)
+        n_unseen    = max(1, round(args.unseen_task_ratio * len(all_task_ids)))
+        unseen_ids  = set(shuffled_ids[:n_unseen])
+        seen_ids    = set(shuffled_ids[n_unseen:])
+
+        seen_idx   = [i for i, r in enumerate(all_r) if r.task_id in seen_ids]
+        unseen_idx = [i for i, r in enumerate(all_r) if r.task_id in unseen_ids]
+        rng.shuffle(seen_idx)
+
+        # Split seen into train / calibration (remaining seen → optional seen-test)
+        seen_s_idx = [i for i in seen_idx if     all_r[i].episode_success]
+        seen_f_idx = [i for i in seen_idx if not all_r[i].episode_success]
+        # Use train_ratio / (train_ratio + calib_ratio) of seen for train
+        split_frac = args.train_ratio / (args.train_ratio + args.calib_ratio + 1e-9)
+        n_tr_s = max(1, int(len(seen_s_idx) * split_frac))
+        n_tr_f = max(1, int(len(seen_f_idx) * split_frac))
+
+        tr_idx = seen_s_idx[:n_tr_s] + seen_f_idx[:n_tr_f]
+        ca_idx = seen_s_idx[n_tr_s:]  + seen_f_idx[n_tr_f:]
+        te_idx = unseen_idx    # ← entirely new tasks
+
+        print(f"\n  Seen   tasks ({len(seen_ids)}):   {sorted(seen_ids)}")
+        print(f"  Unseen tasks ({len(unseen_ids)}): {sorted(unseen_ids)}  "
+              f"← test set")
+    else:
+        # ── Random episode split (backward-compat, inflated metrics) ─────────
+        print("\n  WARNING: --unseen_task_ratio=0  →  random episode split."
+              " Metrics are inflated due to task leakage.")
+        s_idx = [i for i, r in enumerate(all_r) if     r.episode_success]
+        f_idx = [i for i, r in enumerate(all_r) if not r.episode_success]
+        rng.shuffle(s_idx); rng.shuffle(f_idx)
+
+        def _split3(idx):
+            n    = len(idx)
+            n_tr = max(1, int(n * args.train_ratio))
+            n_ca = max(1, int(n * args.calib_ratio))
+            return idx[:n_tr], idx[n_tr:n_tr+n_ca], idx[n_tr+n_ca:]
+
+        s_tr, s_ca, s_te = _split3(s_idx)
+        f_tr, f_ca, f_te = _split3(f_idx)
+        tr_idx = s_tr + f_tr
+        ca_idx = s_ca + f_ca
+        te_idx = s_te + f_te
+
+    train_r, train_emb = _gather(tr_idx)
+    calib_r, calib_emb = _gather(ca_idx)
+    test_r,  test_emb  = _gather(te_idx)
+
     print(f"  Train: {_counts(train_r)}")
     print(f"  Calib: {_counts(calib_r)}")
-    print(f"  Test:  {_counts(test_r)}")
+    print(f"  Test:  {_counts(test_r)}"
+          + (" (unseen tasks)" if args.unseen_task_ratio > 0 else ""))
 
     # ── 4. Train base ────────────────────────────────────────────────────────
     print("\n[3/6] Training base detector ...")
