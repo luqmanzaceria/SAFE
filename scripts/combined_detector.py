@@ -324,9 +324,13 @@ def calibrate_threshold(calib_rollouts, calib_scores, alpha: float) -> float:
     """
     Returns the α-th quantile of calibration failure scores.
     Guarantees P(score ≥ τ | failure) ≥ 1−α on exchangeable test data.
+    Accepts plain score arrays or (score, weight) tuples from the combined model.
     """
-    fail_scores = [s[-1] for r, s in zip(calib_rollouts, calib_scores)
-                   if not r.episode_success]
+    fail_scores = []
+    for r, s in zip(calib_rollouts, calib_scores):
+        if not r.episode_success:
+            final = s[0][-1] if isinstance(s, tuple) else s[-1]
+            fail_scores.append(float(final))
     if not fail_scores:
         raise ValueError("No failures in calibration set.")
     n     = len(fail_scores)
@@ -336,12 +340,16 @@ def calibrate_threshold(calib_rollouts, calib_scores, alpha: float) -> float:
 
 
 def _eval_at_thresh(rollouts, scores, tau: float):
-    y_true  = np.array([1 - r.episode_success for r in rollouts])
-    y_pred  = (np.array([s[-1] for s in scores]) >= tau).astype(int)
-    n_fail  = y_true.sum(); n_succ = (1 - y_true).sum()
-    recall  = (y_pred[y_true == 1] == 1).sum() / max(n_fail, 1)
-    far     = (y_pred[y_true == 0] == 1).sum() / max(n_succ, 1)
-    acc     = (y_pred == y_true).mean()
+    y_true = np.array([1 - r.episode_success for r in rollouts])
+    finals = np.array([
+        float(s[0][-1]) if isinstance(s, tuple) else float(s[-1])
+        for s in scores
+    ])
+    y_pred = (finals >= tau).astype(int)
+    n_fail = y_true.sum(); n_succ = (1 - y_true).sum()
+    recall = (y_pred[y_true == 1] == 1).sum() / max(n_fail, 1)
+    far    = (y_pred[y_true == 0] == 1).sum() / max(n_succ, 1)
+    acc    = (y_pred == y_true).mean()
     return float(recall), float(far), float(acc)
 
 
@@ -666,7 +674,7 @@ def plot_summary(test_r, base_scores, comb_out,
     alphas = np.linspace(0.02, 0.40, 35)
     for calib_s, test_s, label, color in [
         (calib_base, base_scores, "Base",     "steelblue"),
-        (calib_comb, [(s, w) for s, w in comb_out], "Combined", "darkorange"),
+        (calib_comb, comb_out,    "Combined", "darkorange"),
     ]:
         recalls = []
         for a in alphas:
@@ -826,8 +834,7 @@ def main():
     # Conformal calibration
     alpha    = 1.0 - args.target_recall
     tau_base = calibrate_threshold(calib_r, base_calib, alpha)
-    tau_comb = calibrate_threshold(calib_r,
-                                   [(s, w) for s, w in comb_calib], alpha)
+    tau_comb = calibrate_threshold(calib_r, comb_calib, alpha)
 
     # ── 7. Results ───────────────────────────────────────────────────────────
     print("\n[6/6] Evaluating & visualising ...")
@@ -835,48 +842,23 @@ def main():
     y_base  = np.array([s[-1]      for s in base_test])
     y_comb  = np.array([s[-1]      for s, _ in comb_test])
 
-    lines = []
-    def _report(title, y_score, tau):
-        lines.append(f"\n─── {title} ───")
-        if len(np.unique(y_true)) > 1:
-            lines.append(f"  AUC:                 {roc_auc_score(y_true, y_score):.4f}")
-        rec, far, acc_conf = _eval_at_thresh(test_r,
-                                              [(s, None) for s in y_score.tolist()]
-                                              if False else
-                                              [([v], None) for v in y_score],
-                                              tau)
-        _, _, acc_fixed = _eval_at_thresh(test_r,
-                                           [([v], None) for v in y_score], 0.5)
-        lines.append(f"  Accuracy @ 0.50:     {acc_fixed:.4f}")
-        lines.append(f"  Conformal τ_{alpha:.2f}:    {tau:.4f}")
-        lines.append(f"  Recall  @ τ:         {rec:.4f}  (target ≥ {args.target_recall:.0%})")
-        lines.append(f"  FAR     @ τ:         {far:.4f}")
-
-    # Build simple score lists for _eval_at_thresh
-    def _wrap(ys):
-        return [[v] for v in ys]
-
-    def _eval2(rollouts, ys, tau):
-        yt = np.array([1 - r.episode_success for r in rollouts])
-        yp = (np.array(ys) >= tau).astype(int)
-        nf = yt.sum(); ns = (1 - yt).sum()
-        rec = (yp[yt == 1] == 1).sum() / max(nf, 1)
-        far = (yp[yt == 0] == 1).sum() / max(ns, 1)
-        acc = (yp == yt).mean()
-        return float(rec), float(far), float(acc)
-
-    lines = []
-    def _report2(title, ys, tau):
+    def _report(title, ys, tau):
         lines.append(f"\n─── {title} ───")
         if len(np.unique(y_true)) > 1:
             lines.append(f"  AUC:                 {roc_auc_score(y_true, ys):.4f}")
-        _, _, acc_f = _eval2(test_r, ys, 0.5)
-        rec, far, acc_c = _eval2(test_r, ys, tau)
+        yt = y_true
+        acc_f  = float(((ys >= 0.5).astype(int) == yt).mean())
+        nf, ns = yt.sum(), (1 - yt).sum()
+        yp_tau = (ys >= tau).astype(int)
+        rec = float((yp_tau[yt == 1] == 1).sum() / max(nf, 1))
+        far = float((yp_tau[yt == 0] == 1).sum() / max(ns, 1))
+        acc_c = float((yp_tau == yt).mean())
         lines.append(f"  Accuracy @ 0.50:     {acc_f:.4f}")
         lines.append(f"  Conformal τ={tau:.4f}: recall={rec:.4f}  FAR={far:.4f}  acc={acc_c:.4f}")
 
-    _report2("Base detector",     y_base, tau_base)
-    _report2("Combined detector", y_comb, tau_comb)
+    lines = []
+    _report("Base detector",     y_base, tau_base)
+    _report("Combined detector", y_comb, tau_comb)
 
     print("\n" + "=" * 60)
     print("COMBINED DETECTOR — RESULTS")
