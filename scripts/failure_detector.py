@@ -316,7 +316,11 @@ def plot_training_loss(losses, save_path):
 
 
 def plot_score_curves(rollouts, scores, title, save_path):
-    """Mean +/- std failure score over normalised time for each outcome."""
+    """
+    Mean +/- std failure score over normalised time for each outcome.
+    Individual rollout traces are drawn faintly behind the mean so that
+    curves at the extremes (near 0 or 1) are always visible.
+    """
     n = 100
     succ, fail = [], []
     for r, s in zip(rollouts, scores):
@@ -324,6 +328,7 @@ def plot_score_curves(rollouts, scores, title, save_path):
 
     fig, ax = plt.subplots(figsize=(9, 4))
     x = np.linspace(0, 1, n)
+
     for curves, label, color in [
         (succ, f"Success  (n={len(succ)})", "seagreen"),
         (fail, f"Failure  (n={len(fail)})", "crimson"),
@@ -331,14 +336,21 @@ def plot_score_curves(rollouts, scores, title, save_path):
         if not curves:
             continue
         arr = np.stack(curves)
+
+        # Draw individual rollout traces faintly so lines at 0/1 are visible
+        for trace in arr:
+            ax.plot(x, trace, color=color, lw=0.4, alpha=0.15)
+
         mean, std = arr.mean(0), arr.std(0)
-        ax.plot(x, mean, color=color, lw=2, label=label)
-        ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
+        ax.plot(x, mean, color=color, lw=2.5, label=label, zorder=3)
+        ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.25)
 
     ax.axhline(0.5, color="orange", linestyle="--", lw=1, label="Threshold 0.5")
     ax.set_xlabel("Normalised time  (0 = start, 1 = end)")
     ax.set_ylabel("Cumulative failure score")
-    ax.set_title(title); ax.legend(); ax.set_ylim(0, 1)
+    ax.set_title(title); ax.legend()
+    # Pad y-axis so lines pressed against 0 or 1 are not hidden by the axis spine
+    ax.set_ylim(-0.05, 1.05)
     ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(save_path, dpi=150); plt.close(fig)
     print(f"  -> {save_path}")
@@ -370,8 +382,11 @@ def plot_score_histogram(rollouts, scores, save_path):
     succ = [s[-1] for r, s in zip(rollouts, scores) if     r.episode_success]
     fail = [s[-1] for r, s in zip(rollouts, scores) if not r.episode_success]
 
-    fig, ax = plt.subplots(figsize=(7, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     bins = np.linspace(0, 1, 30)
+
+    # Left: overlapping histogram (shared density scale)
+    ax = axes[0]
     if succ:
         ax.hist(succ, bins=bins, color="seagreen", alpha=0.6,
                 label=f"Success  (n={len(succ)})", density=True)
@@ -380,8 +395,31 @@ def plot_score_histogram(rollouts, scores, save_path):
                 label=f"Failure  (n={len(fail)})",  density=True)
     ax.axvline(0.5, color="orange", linestyle="--", lw=1.5, label="Threshold 0.5")
     ax.set_xlabel("Final failure score"); ax.set_ylabel("Density")
-    ax.set_title("Distribution of Final Failure Scores")
+    ax.set_title("Score Distribution (shared axis)")
     ax.legend(); ax.grid(True, alpha=0.3)
+
+    # Right: separate y-axes so both distributions are readable even when one
+    # is much taller than the other (common with imbalanced classes)
+    ax2 = axes[1]
+    ax2_r = ax2.twinx()
+    if succ:
+        ax2.hist(succ, bins=bins, color="seagreen", alpha=0.6,
+                 label=f"Success  (n={len(succ)})", density=True)
+    if fail:
+        ax2_r.hist(fail, bins=bins, color="crimson", alpha=0.5,
+                   label=f"Failure  (n={len(fail)})", density=True)
+    ax2.axvline(0.5, color="orange", linestyle="--", lw=1.5)
+    ax2.set_xlabel("Final failure score")
+    ax2.set_ylabel("Density (success)", color="seagreen")
+    ax2_r.set_ylabel("Density (failure)", color="crimson")
+    ax2.tick_params(axis="y", labelcolor="seagreen")
+    ax2_r.tick_params(axis="y", labelcolor="crimson")
+    ax2.set_title("Score Distribution (independent axes)")
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = ax2_r.get_legend_handles_labels()
+    ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
     fig.tight_layout(); fig.savefig(save_path, dpi=150); plt.close(fig)
     print(f"  -> {save_path}")
 
@@ -467,19 +505,24 @@ def plot_summary(train_r, test_r, train_s, test_s, save_path):
             if not curves:
                 continue
             arr = np.stack(curves)
+            # Faint individual traces so extreme-value curves are visible
+            for trace in arr:
+                ax.plot(x, trace, color=color, lw=0.4, alpha=0.12)
             mean, std = arr.mean(0), arr.std(0)
-            ax.plot(x, mean, color=color, lw=2, label=label)
+            ax.plot(x, mean, color=color, lw=2, label=label, zorder=3)
             ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
         ax.axhline(0.5, color="orange", linestyle="--", lw=1)
         ax.set_xlabel("Normalised time"); ax.set_ylabel("Failure score")
-        ax.set_title(title); ax.legend(fontsize=8); ax.set_ylim(0, 1)
+        ax.set_title(title); ax.legend(fontsize=8)
+        ax.set_ylim(-0.05, 1.05)   # pad so lines at 0/1 are not hidden
         ax.grid(True, alpha=0.3)
 
     _score_curves(fig.add_subplot(gs[0, 0]), train_r, train_s, "Score Curves -- Train")
     _score_curves(fig.add_subplot(gs[0, 1]), test_r,  test_s,  "Score Curves -- Test")
 
-    # Histogram (test)
-    ax_h = fig.add_subplot(gs[1, 0])
+    # Histogram with independent y-axes so both distributions are readable
+    ax_h  = fig.add_subplot(gs[1, 0])
+    ax_h2 = ax_h.twinx()
     bins  = np.linspace(0, 1, 30)
     succ_f = [s[-1] for r, s in zip(test_r, test_s) if     r.episode_success]
     fail_f = [s[-1] for r, s in zip(test_r, test_s) if not r.episode_success]
@@ -487,12 +530,19 @@ def plot_summary(train_r, test_r, train_s, test_s, save_path):
         ax_h.hist(succ_f, bins=bins, color="seagreen", alpha=0.6,
                   label=f"Success (n={len(succ_f)})", density=True)
     if fail_f:
-        ax_h.hist(fail_f, bins=bins, color="crimson",  alpha=0.6,
-                  label=f"Failure (n={len(fail_f)})",  density=True)
+        ax_h2.hist(fail_f, bins=bins, color="crimson", alpha=0.5,
+                   label=f"Failure (n={len(fail_f)})", density=True)
     ax_h.axvline(0.5, color="orange", linestyle="--", lw=1.5)
-    ax_h.set_xlabel("Final failure score"); ax_h.set_ylabel("Density")
+    ax_h.set_xlabel("Final failure score")
+    ax_h.set_ylabel("Density (success)", color="seagreen")
+    ax_h2.set_ylabel("Density (failure)", color="crimson")
+    ax_h.tick_params(axis="y", labelcolor="seagreen")
+    ax_h2.tick_params(axis="y", labelcolor="crimson")
     ax_h.set_title("Final Score Distribution -- Test")
-    ax_h.legend(fontsize=8); ax_h.grid(True, alpha=0.3)
+    lines1, lbl1 = ax_h.get_legend_handles_labels()
+    lines2, lbl2 = ax_h2.get_legend_handles_labels()
+    ax_h.legend(lines1 + lines2, lbl1 + lbl2, fontsize=8)
+    ax_h.grid(True, alpha=0.3)
 
     # PCA (all rollouts, train=circle, test=triangle)
     all_r   = train_r + test_r
