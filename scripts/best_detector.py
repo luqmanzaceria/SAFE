@@ -138,16 +138,19 @@ plt.rcParams.update({
 
 MODEL_COLORS = {
     "base": "#2166ac",
+    "safe": "#4dac26",
     "lstm": "#1a9641",
     "attn": "#d73027",
 }
 MODEL_LABELS = {
-    "base": "Base MLP (running mean)",
+    "base": "Base MLP (BCE + running mean)",
+    "safe": "SAFE IndepModel (hinge + time-weight)",
     "lstm": "LSTM (SAFE architecture)",
-    "attn": "Temporal Attention ★",
+    "attn": "Temporal Attention ★ (ours)",
 }
 MODEL_LS = {
-    "base": "--",
+    "base": ":",
+    "safe": "--",
     "lstm": "-.",
     "attn": "-",
 }
@@ -156,6 +159,103 @@ MODEL_LS = {
 def _c(name): return MODEL_COLORS.get(name, "gray")
 def _l(name): return MODEL_LABELS.get(name, name)
 def _ls(name): return MODEL_LS.get(name, "-")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SAFE's training recipe  (faithfully re-implemented from failure_prob/)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _safe_time_weights(masks: torch.Tensor) -> torch.Tensor:
+    """Exponential early-step weighting used by SAFE: 5·exp(−3·t/T) + 1.
+
+    This is the key mechanism behind SAFE's early detection: the training
+    loss upweights early timesteps so the model learns to fire sooner.
+    """
+    B, T = masks.shape
+    seq_lengths = masks.long().sum(dim=-1).clamp(min=1).float()  # (B,)
+    t     = torch.arange(T, device=masks.device).float()         # (T,)
+    t_rel = t.unsqueeze(0) / seq_lengths.unsqueeze(1)            # (B, T)
+    w     = 5.0 * torch.exp(-3.0 * t_rel) + 1.0                 # (B, T)
+    w     = w * masks
+    # Normalise so that mean weight per valid step = 1
+    w_norm = w.sum(-1) / seq_lengths                             # (B,)
+    return w / (w_norm.unsqueeze(1) + 1e-8)                     # (B, T)
+
+
+def _safe_hinge_loss(scores: torch.Tensor, masks: torch.Tensor,
+                     labels: torch.Tensor, threshold: float = 0.5,
+                     lambda_reg: float = 0.0, model=None) -> torch.Tensor:
+    """SAFE's hinge loss with exponential time weighting.
+
+    For success episodes: penalise scores above 0  (push scores ↓)
+    For failure episodes: penalise scores below τ  (push scores ↑, early)
+    Class-balanced so that the minority class does not dominate.
+    """
+    time_w  = _safe_time_weights(masks)                          # (B, T)
+    succ    = (labels == 1).float().unsqueeze(1)                 # failure=0,succ=1
+    fail    = (labels == 0).float().unsqueeze(1)
+
+    loss_s  = torch.relu(scores - 0.0) * succ                   # (B, T)
+    loss_f  = time_w * torch.relu(threshold - scores) * fail    # (B, T)
+    losses  = loss_s + loss_f                                    # (B, T)
+
+    seq_loss = (losses * masks).sum(-1) / (masks.sum(-1) + 1e-8)  # (B,)
+    n_s = succ.sum() + 1e-6;  n_f = fail.sum() + 1e-6
+    total = n_s + n_f
+    monitor = ((n_f / total) * (fail.squeeze(1) * seq_loss).sum() / (n_f / B + 1e-8) +
+               (n_s / total) * (succ.squeeze(1) * seq_loss).sum() / (n_s / B + 1e-8)) / B
+
+    if model is not None and lambda_reg > 0:
+        reg = sum(p.pow(2).sum() for n, p in model.named_parameters() if "weight" in n)
+        monitor = monitor + lambda_reg * reg
+    return monitor
+
+
+def train_safe_model(model, rollouts, n_epochs=300, lr=1e-3,
+                     lambda_reg=1e-2, threshold=0.5,
+                     batch_size=32, device="cpu"):
+    """Train FailureDetector using SAFE's exact hinge + time-weighting recipe."""
+    from failure_detector import RolloutDataset, _pad_collate
+    loader = DataLoader(RolloutDataset(rollouts), batch_size=batch_size,
+                        shuffle=True, collate_fn=_pad_collate)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+    model.train()
+    losses = []
+    pbar = tqdm(range(n_epochs), desc="Training (SAFE IndepModel)", unit="ep")
+    for _ in pbar:
+        epoch_loss = 0.0
+        for batch in loader:
+            feat = batch["features"].to(device)
+            mask = batch["valid_masks"].to(device)
+            lbl  = batch["success_labels"].to(device)
+            opt.zero_grad()
+            raw  = model.forward_raw(feat)               # (B, T) — raw per-step scores
+            loss = _safe_hinge_loss(raw, mask, lbl,
+                                    threshold=threshold,
+                                    lambda_reg=lambda_reg, model=model)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            epoch_loss += loss.item()
+        avg = epoch_loss / len(loader)
+        losses.append(avg); pbar.set_description(f"Loss {avg:.4f}")
+        sched.step()
+    return losses
+
+
+@torch.no_grad()
+def predict_safe(model, rollouts, device="cpu"):
+    """Returns per-step score curves (running mean, same as predict()) but also
+    stores the per-episode *max* score — SAFE's canonical evaluation statistic."""
+    model.eval()
+    out = []
+    for r in rollouts:
+        feat = r.hidden_states.unsqueeze(0).to(device)
+        mask = torch.ones(1, feat.shape[1], device=device)
+        s    = model(feat, mask).squeeze(0).cpu().numpy()
+        out.append(s)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -210,6 +310,17 @@ def train_and_score(model_name, all_r, input_dim, args, seed):
         sc_ca = predict(m, calib_r, device=device)
         sc_te = predict(m, test_r,  device=device)
 
+    elif model_name == "safe":
+        # SAFE's IndepModel: same MLP architecture, but trained with their
+        # hinge loss + exponential time weighting (see failure_prob/model/indep.py)
+        m = FailureDetector(input_dim, hidden_dim=args.hidden_dim,
+                            n_layers=args.n_layers).to(device)
+        ll = train_safe_model(m, train_r, n_epochs=args.n_epochs, lr=args.lr,
+                              lambda_reg=args.lambda_reg, threshold=0.5,
+                              batch_size=args.batch_size, device=device)
+        sc_ca = predict_safe(m, calib_r, device=device)
+        sc_te = predict_safe(m, test_r,  device=device)
+
     elif model_name == "lstm":
         m = LSTMDetector(input_dim, hidden_dim=args.hidden_dim,
                          n_layers=args.n_lstm_layers).to(device)
@@ -229,6 +340,7 @@ def train_and_score(model_name, all_r, input_dim, args, seed):
             m, train_r, _zero(len(train_r)),
             n_epochs=args.n_epochs, lr=args.lr,
             lambda_reg=args.lambda_reg, lambda_attn=args.lambda_attn,
+            lambda_early=args.lambda_early,
             batch_size=args.batch_size, device=device,
         )
         sc_ca = _predict_combined(m, calib_r, _zero(len(calib_r)), device=device)
@@ -855,8 +967,10 @@ def main():
     parser.add_argument("--data_path",         required=True)
     parser.add_argument("--output_dir",        default="./paper_results")
     parser.add_argument("--models",            nargs="+",
-                        default=["base", "lstm", "attn"],
-                        choices=["base", "lstm", "attn"])
+                        default=["safe", "lstm", "attn"],
+                        choices=["base", "safe", "lstm", "attn"],
+                        help="base=BCE MLP, safe=SAFE's IndepModel (hinge+timeweight), "
+                             "lstm=SAFE's LSTM, attn=temporal attention (ours)")
     parser.add_argument("--seeds",             nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--unseen_task_ratio", type=float, default=0.30)
     parser.add_argument("--target_recall",     type=float, default=0.90)
@@ -865,6 +979,9 @@ def main():
     parser.add_argument("--lr",                type=float, default=1e-3)
     parser.add_argument("--lambda_reg",        type=float, default=1e-2)
     parser.add_argument("--lambda_attn",       type=float, default=0.10)
+    parser.add_argument("--lambda_early",      type=float, default=0.05,
+                        help="Earliness regularisation for attention model. "
+                             "Penalises high scores at late timesteps for failures.")
     parser.add_argument("--hidden_dim",        type=int,   default=256)
     parser.add_argument("--n_layers",          type=int,   default=2)
     parser.add_argument("--n_lstm_layers",     type=int,   default=1)
@@ -917,6 +1034,13 @@ def main():
                             lambda_reg=args.lambda_reg,
                             batch_size=args.batch_size, device=args.device)
                 sc_ca = predict(m2, calib_r, device=args.device)
+            elif name == "safe":
+                m2 = FailureDetector(input_dim, hidden_dim=args.hidden_dim,
+                                     n_layers=args.n_layers).to(args.device)
+                train_safe_model(m2, train_r, n_epochs=1, lr=args.lr,
+                                 lambda_reg=args.lambda_reg, threshold=0.5,
+                                 batch_size=args.batch_size, device=args.device)
+                sc_ca = predict_safe(m2, calib_r, device=args.device)
             elif name == "lstm":
                 m2 = LSTMDetector(input_dim, hidden_dim=args.hidden_dim,
                                   n_layers=args.n_lstm_layers).to(args.device)
@@ -932,6 +1056,7 @@ def main():
                 _train_combined(m2, train_r, _zero(len(train_r)),
                                 n_epochs=1, lr=args.lr, lambda_reg=args.lambda_reg,
                                 lambda_attn=args.lambda_attn,
+                                lambda_early=args.lambda_early,
                                 batch_size=args.batch_size, device=args.device)
                 sc_ca = _predict_combined(m2, calib_r, _zero(len(calib_r)),
                                           device=args.device)

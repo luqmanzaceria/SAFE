@@ -261,7 +261,7 @@ class CombinedFailureDetector(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _train_combined(model, rollouts, task_embeds, n_epochs=300, lr=1e-3,
-                    lambda_reg=1e-2, lambda_attn=0.1,
+                    lambda_reg=1e-2, lambda_attn=0.1, lambda_early=0.05,
                     batch_size=32, device="cpu"):
     dataset = CombinedDataset(rollouts, task_embeds)
     loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True,
@@ -286,18 +286,32 @@ def _train_combined(model, rollouts, task_embeds, n_epochs=300, lr=1e-3,
             loss = _compute_loss(raw, mask, lbl, lambda_reg, model)
 
             # ── Term 2: end-of-episode attn loss (trains weight head) ────────
-            if lambda_attn > 0:
-                scores, _ = model(feat, te, mask)
-                lengths   = mask.long().sum(dim=-1) - 1
-                final     = scores[torch.arange(len(lbl)), lengths]
-                targets   = (1.0 - lbl)
-                n_s = lbl.sum().item() + 1e-6
-                n_f = (1 - lbl).sum().item() + 1e-6
-                pw  = torch.tensor(n_s / n_f, device=device)
-                bce = nn.functional.binary_cross_entropy(
-                    final, targets, reduction="none"
-                )
-                loss = loss + lambda_attn * (bce * (targets * pw + (1 - targets))).mean()
+            if lambda_attn > 0 or lambda_early > 0:
+                scores, weights = model(feat, te, mask)
+                lengths = mask.long().sum(dim=-1) - 1
+
+                if lambda_attn > 0:
+                    final   = scores[torch.arange(len(lbl)), lengths]
+                    targets = (1.0 - lbl)
+                    n_s = lbl.sum().item() + 1e-6
+                    n_f = (1 - lbl).sum().item() + 1e-6
+                    pw  = torch.tensor(n_s / n_f, device=device)
+                    bce = nn.functional.binary_cross_entropy(
+                        final, targets, reduction="none"
+                    )
+                    loss = loss + lambda_attn * (bce * (targets * pw + (1 - targets))).mean()
+
+                if lambda_early > 0:
+                    # Earliness regularisation: for failure episodes, penalise
+                    # high scores at late timesteps.
+                    # L_early = mean over failure eps of Σ_t (t/T) * score_t
+                    # This is differentiable and directly optimises avg_det.
+                    T     = scores.shape[1]
+                    pos   = torch.arange(T, device=device).float() / (T - 1 + 1e-8)
+                    pos   = pos.unsqueeze(0)           # (1, T)
+                    fail  = (1.0 - lbl).unsqueeze(1)   # (B, 1)  1 = failure episode
+                    early_loss = (pos * scores * mask * fail).sum() / (fail.sum() + 1e-8)
+                    loss  = loss + lambda_early * early_loss
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)

@@ -142,10 +142,14 @@ class LSTMDetector(nn.Module):
     def forward(self, features: torch.Tensor,
                 valid_masks: torch.Tensor,
                 task_embeds: torch.Tensor | None = None) -> torch.Tensor:
-        """Returns causal running-mean of LSTM scores (B, T)."""
-        raw  = self.forward_raw(features, task_embeds) * valid_masks
-        cnt  = torch.cumsum(valid_masks, dim=-1) + 1e-8
-        return torch.cumsum(raw, dim=-1) / cnt * valid_masks
+        """Returns per-step LSTM scores (B, T).
+
+        Unlike the MLP, the LSTM hidden state h_t already encodes all
+        previous steps — accumulating a running mean on top would add
+        noise and cause early-step scores to dominate (leading to
+        avg_det=0 collapse).  Raw per-step scores are the right output.
+        """
+        return self.forward_raw(features, task_embeds) * valid_masks
 
     def get_final_hidden(self, features: torch.Tensor,
                          task_embeds: torch.Tensor | None = None) -> torch.Tensor:
