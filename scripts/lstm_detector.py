@@ -113,10 +113,15 @@ class LSTMDetector(nn.Module):
             batch_first=True,
             dropout=dropout if n_layers > 1 else 0.0,
         )
+        score_linear = nn.Linear(hidden_dim // 2, 1)
+        # Bias the output toward 0 (not failure) at initialisation.
+        # Without this the LSTM collapses to always predicting failure.
+        with torch.no_grad():
+            score_linear.bias.fill_(-2.0)
         self.score_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            score_linear,
             nn.Sigmoid(),
         )
 
@@ -337,7 +342,8 @@ def main():
     parser.add_argument("--unseen_task_ratio", type=float, default=0.30)
     parser.add_argument("--target_recall",     type=float, default=0.90)
     parser.add_argument("--n_epochs",          type=int,   default=300)
-    parser.add_argument("--lr",                type=float, default=1e-3)
+    parser.add_argument("--lr",                type=float, default=5e-4,
+                        help="LSTM trains best with a slightly lower LR than MLP")
     parser.add_argument("--lambda_reg",        type=float, default=1e-2)
     parser.add_argument("--hidden_dim",        type=int,   default=256)
     parser.add_argument("--n_lstm_layers",     type=int,   default=1)

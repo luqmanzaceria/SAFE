@@ -186,7 +186,8 @@ def run_one_seed(all_r, clip_emb, lsa_emb, input_dim, args, seed):
         print(f"\n  [seed={seed}] Training LSTM ...")
         m = LSTMDetector(input_dim, hidden_dim=args.hidden_dim,
                          n_layers=args.n_lstm_layers).to(device)
-        ll = train_lstm(m, train_r, n_epochs=args.n_epochs, lr=args.lr,
+        # LSTM trains best at lower LR to avoid collapse
+        ll = train_lstm(m, train_r, n_epochs=args.n_epochs, lr=min(args.lr, 5e-4),
                         lambda_reg=args.lambda_reg, batch_size=args.batch_size,
                         device=device)
         sc_ca = predict_lstm(m, calib_r, device=device)
