@@ -199,11 +199,14 @@ def _safe_hinge_loss(scores: torch.Tensor, masks: torch.Tensor,
     loss_f  = time_w * torch.relu(threshold - scores) * fail    # (B, T)
     losses  = loss_s + loss_f                                    # (B, T)
 
+    B = masks.shape[0]
     seq_loss = (losses * masks).sum(-1) / (masks.sum(-1) + 1e-8)  # (B,)
-    n_s = succ.sum() + 1e-6;  n_f = fail.sum() + 1e-6
-    total = n_s + n_f
-    monitor = ((n_f / total) * (fail.squeeze(1) * seq_loss).sum() / (n_f / B + 1e-8) +
-               (n_s / total) * (succ.squeeze(1) * seq_loss).sum() / (n_s / B + 1e-8)) / B
+    n_s = succ.squeeze(1).sum() + 1e-6
+    n_f = fail.squeeze(1).sum() + 1e-6
+    # Class-balanced mean: weight each class by inverse frequency
+    fail_loss = (fail.squeeze(1) * seq_loss).sum() / n_f
+    succ_loss = (succ.squeeze(1) * seq_loss).sum() / n_s
+    monitor   = (fail_loss + succ_loss) / 2.0
 
     if model is not None and lambda_reg > 0:
         reg = sum(p.pow(2).sum() for n, p in model.named_parameters() if "weight" in n)
