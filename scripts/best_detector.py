@@ -796,10 +796,11 @@ def write_summary(models, agg, n_seeds, unseen_ids_per_seed, args, out_dir):
         delta_auc = attn_auc - base_auc
         lines.append(f"  Attn vs Base Δ-AUC:          {delta_auc:+.4f}")
     if attn_det and base_det:
-        delta_det = base_det - attn_det
+        delta_det = base_det - attn_det          # positive = attn is faster
         pct       = delta_det / base_det * 100 if base_det > 0 else 0
+        direction = "earlier" if delta_det >= 0 else "later"
         lines.append(f"  Attn vs Base Δ-det-time:     {delta_det:+.4f}  "
-                     f"({pct:.1f}% earlier detection)")
+                     f"({abs(pct):.1f}% {direction} detection)")
 
     lines += [
         "",
@@ -816,13 +817,23 @@ def write_summary(models, agg, n_seeds, unseen_ids_per_seed, args, out_dir):
             + f" vs the MLP baseline AUC={base_auc:.3f}"
             + (f"±{agg['base']['auc'][1]:.3f}" if n_seeds > 1 else "") + "."
         )
-    if attn_det and base_det and attn_det < base_det:
-        pct = (base_det - attn_det) / base_det * 100
+    if attn_det and base_det:
+        pct = abs(base_det - attn_det) / base_det * 100
+        direction = "earlier" if attn_det < base_det else "later"
         lines.append(
-            f"   The attention model detects failures {pct:.0f}% earlier in the"
-            f" episode  (avg_det {attn_det:.3f} vs {base_det:.3f} for MLP)"
-            f" while maintaining comparable recall and zero false alarms.'"
+            f"   The attention model detects failures {pct:.0f}% {direction} in the"
+            f" episode  (avg_det {attn_det:.3f} vs {base_det:.3f} for MLP)."
         )
+        if attn_det >= base_det:
+            lines.append(
+                "   NOTE: avg_det is currently worse than baseline — increase"
+                " --n_epochs to ≥300 for the attention weights to converge.'"
+            )
+        else:
+            lines.append(
+                "   The attention model maintains comparable recall and "
+                "near-zero false alarms.'"
+            )
     lines += ["", "=" * 72]
 
     txt = "\n".join(lines)
