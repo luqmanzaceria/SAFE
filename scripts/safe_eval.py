@@ -75,8 +75,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# ── Path setup ───────────────────────────────────────────────────────────────
+_SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
+_REPO_ROOT   = os.path.abspath(os.path.join(_SCRIPTS_DIR, ".."))
+sys.path.insert(0, _SCRIPTS_DIR)
+sys.path.insert(0, _REPO_ROOT)
+
 # ── Our existing modules ─────────────────────────────────────────────────────
-sys.path.insert(0, os.path.dirname(__file__))
 from failure_detector import (
     load_rollouts, FailureDetector,
     RolloutDataset, _pad_collate,
@@ -90,7 +95,6 @@ from best_detector import (
 )
 
 # ── SAFE's evaluation functions (imported directly — no wandb/hydra needed) ──
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from failure_prob.utils.metrics import (
     eval_det_time_vs_classification,
     eval_fixed_threshold as _safe_eval_fixed,
