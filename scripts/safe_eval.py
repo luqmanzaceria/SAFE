@@ -76,10 +76,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # ── Path setup ───────────────────────────────────────────────────────────────
-_SCRIPTS_DIR = os.path.abspath(os.path.dirname(__file__))
-_REPO_ROOT   = os.path.abspath(os.path.join(_SCRIPTS_DIR, ".."))
-sys.path.insert(0, _SCRIPTS_DIR)
-sys.path.insert(0, _REPO_ROOT)
+# Use realpath so symlinks, relative paths, and bare filenames all resolve.
+_THIS_FILE   = os.path.realpath(os.path.abspath(__file__))
+_SCRIPTS_DIR = os.path.dirname(_THIS_FILE)          # .../SAFE/scripts
+_REPO_ROOT   = os.path.dirname(_SCRIPTS_DIR)        # .../SAFE
+for _p in (_SCRIPTS_DIR, _REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # ── Our existing modules ─────────────────────────────────────────────────────
 from failure_detector import (
