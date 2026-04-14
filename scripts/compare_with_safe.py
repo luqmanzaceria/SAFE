@@ -429,11 +429,11 @@ def run_one_seed(rollouts, seed, args, device):
         hidden_state_dim=input_dim, task_embed_dim=0,
         hidden_dim=256, n_layers=2, dropout=0.1,
     ).to(device)
-    train_attn_hinge(attn_model, train_r, task_embeds={},
+    train_attn_hinge(attn_model, train_r,
                      n_epochs=args.n_epochs, lr=args.lr,
                      lambda_reg=args.lambda_reg, device=device)
 
-    raw_ours = predict_attn_hinge(attn_model, val_r, {}, device)
+    raw_ours = predict_attn_hinge(attn_model, val_r, device)
     # predict_attn_hinge returns (score_curve, weight_curve) tuples
     ours_curves = [sc if not isinstance(sc, tuple) else sc[0]
                    for sc in raw_ours]
