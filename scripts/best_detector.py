@@ -137,22 +137,28 @@ plt.rcParams.update({
 })
 
 MODEL_COLORS = {
-    "base": "#2166ac",
-    "safe": "#4dac26",
-    "lstm": "#1a9641",
-    "attn": "#d73027",
+    "base":   "#2166ac",
+    "safe":   "#4dac26",
+    "lstm":   "#999999",
+    "lstm_h": "#1a9641",
+    "attn":   "#f4a582",
+    "attn_h": "#d73027",
 }
 MODEL_LABELS = {
-    "base": "Base MLP (BCE + running mean)",
-    "safe": "SAFE IndepModel (hinge + time-weight)",
-    "lstm": "LSTM (SAFE architecture)",
-    "attn": "Temporal Attention ★ (ours)",
+    "base":   "Base MLP (BCE + running mean)",
+    "safe":   "SAFE IndepModel (hinge + time-weight)",
+    "lstm":   "LSTM (BCE loss)",
+    "lstm_h": "LSTM + Hinge loss",
+    "attn":   "Temporal Attention (BCE)",
+    "attn_h": "Temporal Attention + Hinge ★ (ours)",
 }
 MODEL_LS = {
-    "base": ":",
-    "safe": "--",
-    "lstm": "-.",
-    "attn": "-",
+    "base":   ":",
+    "safe":   "--",
+    "lstm":   "-.",
+    "lstm_h": "-.",
+    "attn":   (0, (3, 1, 1, 1)),
+    "attn_h": "-",
 }
 
 
@@ -261,6 +267,122 @@ def predict_safe(model, rollouts, device="cpu"):
     return out
 
 
+def train_lstm_hinge(model, rollouts, n_epochs=300, lr=5e-4,
+                     lambda_reg=1e-2, threshold=0.5,
+                     batch_size=32, device="cpu"):
+    """Train LSTMDetector with SAFE's hinge + time-weight loss.
+
+    BCE training causes the LSTM to collapse to predicting failure everywhere.
+    SAFE's hinge loss has a hard margin — the model must be *above* threshold
+    for failures and *below* 0 for successes, creating a clean decision boundary
+    and preventing the degenerate solution.
+    """
+    from failure_detector import RolloutDataset, _pad_collate
+    loader = DataLoader(RolloutDataset(rollouts), batch_size=batch_size,
+                        shuffle=True, collate_fn=_pad_collate)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+    model.train()
+    losses = []
+    pbar = tqdm(range(n_epochs), desc="Training (LSTM+Hinge)", unit="ep")
+    for _ in pbar:
+        epoch_loss = 0.0
+        for batch in loader:
+            feat = batch["features"].to(device)
+            mask = batch["valid_masks"].to(device)
+            lbl  = batch["success_labels"].to(device)
+            opt.zero_grad()
+            raw  = model.forward_raw(feat)
+            loss = _safe_hinge_loss(raw, mask, lbl, threshold=threshold,
+                                    lambda_reg=lambda_reg, model=model)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            epoch_loss += loss.item()
+        avg = epoch_loss / len(loader)
+        losses.append(avg); pbar.set_description(f"Loss {avg:.4f}")
+        sched.step()
+    return losses
+
+
+def train_attn_hinge(model, rollouts, n_epochs=300, lr=1e-3,
+                     lambda_reg=1e-2, lambda_attn=0.10, threshold=0.5,
+                     batch_size=32, device="cpu"):
+    """Train CombinedFailureDetector (attention) with SAFE's hinge + time-weight.
+
+    This is the core contribution:  SAFE's proven training recipe applied to
+    a learned-attention aggregator instead of a fixed running mean.
+
+    Two-term loss
+    -------------
+    Term 1 (score head + encoder)
+        SAFE's hinge loss with exponential time weighting on raw per-step
+        scores.  Pushes failure scores ≥ τ early in the episode and success
+        scores toward 0 at all timesteps.
+
+    Term 2 (weight head)
+        BCE on the final attention-weighted cumulative score.  Trains the
+        weight head to upweight the most diagnostic timestep.
+    """
+    from failure_detector import RolloutDataset, _pad_collate
+    loader = DataLoader(RolloutDataset(rollouts), batch_size=batch_size,
+                        shuffle=True, collate_fn=_pad_collate)
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+    model.train()
+    losses = []
+    pbar = tqdm(range(n_epochs), desc="Training (Attn+Hinge)", unit="ep")
+    for _ in pbar:
+        epoch_loss = 0.0
+        for batch in loader:
+            feat = batch["features"].to(device)
+            mask = batch["valid_masks"].to(device)
+            lbl  = batch["success_labels"].to(device)
+
+            opt.zero_grad()
+
+            # ── Term 1: SAFE hinge on raw per-step scores ────────────────────
+            raw  = model.forward_raw(feat, None)   # task_embed_dim=0 → None OK
+            loss = _safe_hinge_loss(raw, mask, lbl, threshold=threshold,
+                                    lambda_reg=lambda_reg, model=model)
+
+            # ── Term 2: attention weight head alignment ──────────────────────
+            if lambda_attn > 0:
+                scores, _ = model(feat, None, mask)    # causal attention-weighted
+                lengths   = mask.long().sum(dim=-1) - 1
+                final     = scores[torch.arange(len(lbl)), lengths].clamp(1e-7, 1 - 1e-7)
+                targets   = (1.0 - lbl)
+                n_s = lbl.sum() + 1e-6;  n_f = (1 - lbl).sum() + 1e-6
+                pw  = torch.tensor(n_s / n_f, device=device)
+                bce = nn.functional.binary_cross_entropy(final, targets,
+                                                         reduction="none")
+                loss = loss + lambda_attn * (bce * (targets * pw + (1 - targets))).mean()
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            epoch_loss += loss.item()
+
+        avg = epoch_loss / len(loader)
+        losses.append(avg); pbar.set_description(f"Loss {avg:.4f}")
+        sched.step()
+    return losses
+
+
+@torch.no_grad()
+def predict_attn_hinge(model, rollouts, device="cpu"):
+    """Inference for the attention+hinge model — returns (score_curve, weight_curve)
+    tuples identical to _predict_combined, so all downstream code is reused."""
+    model.eval()
+    out = []
+    for r in rollouts:
+        feat = r.hidden_states.unsqueeze(0).to(device)
+        mask = torch.ones(1, feat.shape[1], device=device)
+        s, w = model(feat, None, mask)
+        out.append((s.squeeze(0).cpu().numpy(), w.squeeze(0).cpu().numpy()))
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Data splitting
 # ══════════════════════════════════════════════════════════════════════════════
@@ -334,6 +456,17 @@ def train_and_score(model_name, all_r, input_dim, args, seed):
         sc_ca = predict_lstm(m, calib_r, device=device)
         sc_te = predict_lstm(m, test_r,  device=device)
 
+    elif model_name == "lstm_h":
+        # LSTM trained with SAFE's hinge + time-weight (fixes BCE collapse)
+        m = LSTMDetector(input_dim, hidden_dim=args.hidden_dim,
+                         n_layers=args.n_lstm_layers).to(device)
+        ll = train_lstm_hinge(m, train_r, n_epochs=args.n_epochs,
+                              lr=min(args.lr, 5e-4),
+                              lambda_reg=args.lambda_reg, threshold=0.5,
+                              batch_size=args.batch_size, device=device)
+        sc_ca = predict_lstm(m, calib_r, device=device)
+        sc_te = predict_lstm(m, test_r,  device=device)
+
     elif model_name == "attn":
         m = CombinedFailureDetector(
             hidden_state_dim=input_dim, task_embed_dim=0,
@@ -348,6 +481,21 @@ def train_and_score(model_name, all_r, input_dim, args, seed):
         )
         sc_ca = _predict_combined(m, calib_r, _zero(len(calib_r)), device=device)
         sc_te = _predict_combined(m, test_r,  _zero(len(test_r)),  device=device)
+
+    elif model_name == "attn_h":
+        # ★ OUR METHOD: temporal attention trained with SAFE's hinge + time-weight
+        # Same architecture as attn; better loss → better AUC + earlier detection
+        m = CombinedFailureDetector(
+            hidden_state_dim=input_dim, task_embed_dim=0,
+            hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+        ).to(device)
+        ll = train_attn_hinge(
+            m, train_r, n_epochs=args.n_epochs, lr=args.lr,
+            lambda_reg=args.lambda_reg, lambda_attn=args.lambda_attn,
+            threshold=0.5, batch_size=args.batch_size, device=device,
+        )
+        sc_ca = predict_attn_hinge(m, calib_r, device=device)
+        sc_te = predict_attn_hinge(m, test_r,  device=device)
 
     else:
         raise ValueError(f"Unknown model: {model_name}")
@@ -970,10 +1118,11 @@ def main():
     parser.add_argument("--data_path",         required=True)
     parser.add_argument("--output_dir",        default="./paper_results")
     parser.add_argument("--models",            nargs="+",
-                        default=["safe", "lstm", "attn"],
-                        choices=["base", "safe", "lstm", "attn"],
-                        help="base=BCE MLP, safe=SAFE's IndepModel (hinge+timeweight), "
-                             "lstm=SAFE's LSTM, attn=temporal attention (ours)")
+                        default=["safe", "attn_h"],
+                        choices=["base", "safe", "lstm", "lstm_h", "attn", "attn_h"],
+                        help="base=BCE MLP  safe=SAFE IndepModel (hinge+timeweight)  "
+                             "lstm=LSTM BCE  lstm_h=LSTM hinge  "
+                             "attn=attn BCE  attn_h=attn hinge ★ (ours)")
     parser.add_argument("--seeds",             nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--unseen_task_ratio", type=float, default=0.30)
     parser.add_argument("--target_recall",     type=float, default=0.90)
@@ -1044,6 +1193,24 @@ def main():
                                  lambda_reg=args.lambda_reg, threshold=0.5,
                                  batch_size=args.batch_size, device=args.device)
                 sc_ca = predict_safe(m2, calib_r, device=args.device)
+            elif name in ("lstm_h",):
+                m2 = LSTMDetector(input_dim, hidden_dim=args.hidden_dim,
+                                  n_layers=args.n_lstm_layers).to(args.device)
+                train_lstm_hinge(m2, train_r, n_epochs=1,
+                                 lr=min(args.lr, 5e-4),
+                                 lambda_reg=args.lambda_reg, threshold=0.5,
+                                 batch_size=args.batch_size, device=args.device)
+                sc_ca = predict_lstm(m2, calib_r, device=args.device)
+            elif name in ("attn_h",):
+                m2 = CombinedFailureDetector(
+                    input_dim, task_embed_dim=0,
+                    hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+                ).to(args.device)
+                train_attn_hinge(m2, train_r, n_epochs=1, lr=args.lr,
+                                 lambda_reg=args.lambda_reg,
+                                 lambda_attn=args.lambda_attn, threshold=0.5,
+                                 batch_size=args.batch_size, device=args.device)
+                sc_ca = predict_attn_hinge(m2, calib_r, device=args.device)
             elif name == "lstm":
                 m2 = LSTMDetector(input_dim, hidden_dim=args.hidden_dim,
                                   n_layers=args.n_lstm_layers).to(args.device)
@@ -1086,8 +1253,10 @@ def main():
 
     fig_roc_prc(args.models, all_seed_scores, all_seed_test_r, args.output_dir)
     fig_detection_time(args.models, all_seed_scores, all_seed_test_r, args.output_dir)
-    if "attn" in args.models:
-        fig_attention(all_seed_scores["attn"], all_seed_test_r["attn"],
+    # Show attention figure for attn_h first (primary model), fallback to attn
+    _attn_key = "attn_h" if "attn_h" in args.models else ("attn" if "attn" in args.models else None)
+    if _attn_key:
+        fig_attention(all_seed_scores[_attn_key], all_seed_test_r[_attn_key],
                       args.output_dir)
     fig_conformal(args.models, all_seed_scores, all_seed_test_r,
                   all_seed_calib_s, all_seed_calib_r, args.output_dir)
