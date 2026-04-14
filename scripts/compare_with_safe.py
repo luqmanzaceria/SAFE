@@ -753,6 +753,8 @@ def main():
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available()
                                                        else "cpu")
     parser.add_argument("--unseen_ratio",  type=float, default=0.30)
+    parser.add_argument("--save_attn_model", action="store_true",
+                        help="Save the trained attention model to output_dir/attn_detector.pth")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -791,6 +793,36 @@ def main():
     if not seed_results:
         print("No valid seed results — check your data.")
         return
+
+    # ── Save attention model (seed 0) for live deployment ────────────────────
+    if args.save_attn_model and seed_results:
+        # Re-train on ALL data with seed 0 for a full-data deployment model
+        print("\n  Saving attention model for live deployment …")
+        rng0 = np.random.default_rng(args.seeds[0])
+        torch.manual_seed(args.seeds[0])
+        input_dim  = rollouts[0].hidden_states.shape[1]
+        full_model = CombinedFailureDetector(
+            hidden_state_dim=input_dim, task_embed_dim=0,
+            hidden_dim=256, n_layers=2, dropout=0.1,
+        ).to(args.device)
+        train_attn_hinge(full_model, rollouts,
+                         n_epochs=args.n_epochs, lr=args.lr,
+                         lambda_reg=args.lambda_reg, device=args.device)
+        ckpt_path = os.path.join(args.output_dir, "attn_detector.pth")
+        torch.save({
+            "model_state_dict": full_model.state_dict(),
+            "hidden_state_dim": input_dim,
+            "task_embed_dim":   0,
+            "hidden_dim":       256,
+            "n_layers":         2,
+            "dropout":          0.1,
+        }, ckpt_path)
+        print(f"  Attention model → {ckpt_path}")
+        print(f"  Deploy with:")
+        print(f"    python scripts/live_attn_detector.py \\")
+        print(f"        --detector_path {ckpt_path} \\")
+        print(f"        --pretrained_checkpoint <openvla_checkpoint> \\")
+        print(f"        --robot libero --task_suite_name libero_spatial")
 
     # ── Aggregate ─────────────────────────────────────────────────────────────
     agg = aggregate(seed_results)
