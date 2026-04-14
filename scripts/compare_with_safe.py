@@ -426,7 +426,7 @@ def run_one_seed(rollouts, seed, args, device):
     # ── Temporal Attention + Hinge  ───────────────────────────────────────────
     print("    Training Temporal Attention + Hinge …")
     attn_model = CombinedFailureDetector(
-        input_dim=input_dim, task_embed_dim=0,
+        hidden_state_dim=input_dim, task_embed_dim=0,
         hidden_dim=256, n_layers=2, dropout=0.1,
     ).to(device)
     train_attn_hinge(attn_model, train_r, task_embeds={},
