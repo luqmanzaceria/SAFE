@@ -755,6 +755,8 @@ def main():
     parser.add_argument("--unseen_ratio",  type=float, default=0.30)
     parser.add_argument("--save_attn_model", action="store_true",
                         help="Save the trained attention model to output_dir/attn_detector.pth")
+    parser.add_argument("--save_seed_results", action="store_true",
+                        help="Pickle seed_results for analyze_comparison.py")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -793,6 +795,14 @@ def main():
     if not seed_results:
         print("No valid seed results — check your data.")
         return
+
+    # ── Save seed_results for downstream analysis ────────────────────────────
+    if args.save_seed_results:
+        import pickle
+        pkl_path = os.path.join(args.output_dir, "seed_results.pkl")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(seed_results, f)
+        print(f"  Seed results → {pkl_path}")
 
     # ── Save attention model (seed 0) for live deployment ────────────────────
     if args.save_attn_model and seed_results:
