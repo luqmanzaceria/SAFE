@@ -677,18 +677,19 @@ def slide07_stats(seed_results, out_dir: str):
         tbl[(0,j)].set_facecolor("#333")
         tbl[(0,j)].set_text_props(color="white", fontweight="bold")
 
+    n_cols = len(col_labs)
     for i, row in enumerate(rows, 1):
         win = row[-1].startswith("✓")
-        tbl[(i,0)].set_facecolor("#f5f5f5")
-        for j in range(1, len(col_labs)):
-            tbl[(i,j)].set_facecolor(C_OURS+"22" if win else C_SAFE+"22")
-        # colour winner cell
-        tbl[(i,-1)].set_facecolor(C_OURS+"55" if win else C_SAFE+"55")
-        tbl[(i,-1)].set_text_props(fontweight="bold",
-                                    color=C_OURS if win else C_SAFE)
-        # colour significance
-        if row[-2] in ("*","**","***"):
-            tbl[(i,-2)].set_text_props(fontweight="bold", color="darkgreen")
+        tbl[(i, 0)].set_facecolor("#f5f5f5")
+        for j in range(1, n_cols):
+            tbl[(i, j)].set_facecolor(C_OURS+"22" if win else C_SAFE+"22")
+        # colour winner cell (last column)
+        tbl[(i, n_cols-1)].set_facecolor(C_OURS+"55" if win else C_SAFE+"55")
+        tbl[(i, n_cols-1)].set_text_props(fontweight="bold",
+                                           color=C_OURS if win else C_SAFE)
+        # colour significance (second-to-last column)
+        if row[-2] in ("*", "**", "***"):
+            tbl[(i, n_cols-2)].set_text_props(fontweight="bold", color="darkgreen")
 
     ax.set_title(
         "Statistical Significance  (paired t-test, 3 seeds)\n"
