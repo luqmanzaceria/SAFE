@@ -435,11 +435,14 @@ def run_one_seed(rollouts, seed, args, device):
 
     raw_ours = predict_attn_hinge(attn_model, val_r, device)
     # predict_attn_hinge returns (score_curve, weight_curve) tuples
-    ours_curves = [sc if not isinstance(sc, tuple) else sc[0]
-                   for sc in raw_ours]
+    ours_curves  = [sc if not isinstance(sc, tuple) else sc[0]
+                    for sc in raw_ours]
+    ours_weights = [None if not isinstance(sc, tuple) else sc[1]
+                    for sc in raw_ours]
     results["ours"] = dict(
         metrics=compute_metrics(ours_curves, None, tms_all, val_r),
         curves=ours_curves,
+        weights=ours_weights,   # (T,) attention weight curves, None if unavailable
         losses=[],
     )
     print(f"    Ours AUC: {results['ours']['metrics']['auc']:.4f}")
